@@ -178,12 +178,14 @@ impl Mixer {
         };
 
         let mut cmd_buffers = Vec::new();
-        let mut is_first = true;
-        for (_i, (channel, &opacity)) in self.channels.iter().zip(opacities.iter()).enumerate() {
+        let mut current_is_composite = true; // Track which texture holds the latest result
+        let mut visible_count = 0;
+
+        for (channel, &opacity) in self.channels.iter().zip(opacities.iter()) {
             if opacity <= 0.0 { continue; }
 
-            if is_first {
-                // First visible channel: simple blit copy
+            if visible_count == 0 {
+                // First visible channel: simple blit copy to composite_view
                 self.blit_pipeline.set_opacity(&context.queue, opacity);
                 let bind_group = self.blit_pipeline.create_bind_group(&context.device, &channel.composite_view);
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -208,22 +210,18 @@ impl Mixer {
                     self.blit_pipeline.render(&mut render_pass, &bind_group);
                 }
                 cmd_buffers.push(encoder.finish());
-                is_first = false;
+                current_is_composite = true;
             } else {
-                // Subsequent channels: snapshot + composite shader
-                let mut copy_encoder = context.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor { label: Some("Mixer Snapshot Copy") },
-                );
-                copy_encoder.copy_texture_to_texture(
-                    self.composite_texture.as_image_copy(),
-                    self.effect_ping_texture.as_image_copy(),
-                    self.composite_texture.size(),
-                );
-                cmd_buffers.push(copy_encoder.finish());
+                // Subsequent channels: blend channel + background → target
+                let (target_view, background_view) = if current_is_composite {
+                    (&self.effect_ping_view, &self.composite_view)
+                } else {
+                    (&self.composite_view, &self.effect_ping_view)
+                };
 
                 let blend_mode = channel.blend_mode;
                 self.composite_pipeline.set_params(&context.queue, opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
-                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &channel.composite_view, &self.effect_ping_view);
+                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &channel.composite_view, background_view);
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Mixer Composite Encoder"),
                 });
@@ -231,7 +229,7 @@ impl Mixer {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Mixer Composite Pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &self.composite_view,
+                            view: target_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -246,7 +244,16 @@ impl Mixer {
                     self.composite_pipeline.render(&mut render_pass, &bind_group);
                 }
                 cmd_buffers.push(encoder.finish());
+                current_is_composite = !current_is_composite;
             }
+            visible_count += 1;
+        }
+
+        // If the final result is in effect_ping_texture, swap it with composite_texture
+        // so that self.composite_view always contains the latest frame for downstream stages.
+        if !current_is_composite {
+            std::mem::swap(&mut self.composite_texture, &mut self.effect_ping_texture);
+            std::mem::swap(&mut self.composite_view, &mut self.effect_ping_view);
         }
 
         if !cmd_buffers.is_empty() {
@@ -293,15 +300,30 @@ impl Mixer {
         };
 
         let mut cmd_buffers = Vec::new();
-        let mut is_first = true;
-        for &ch_idx in indices {
-            if ch_idx >= self.channels.len() { continue; }
-            let channel = &self.channels[ch_idx];
-            let opacity = opacities.get(ch_idx).copied().unwrap_or(0.0);
-            if opacity <= 0.0 { continue; }
 
-            if is_first {
-                // First visible channel: simple blit copy
+        // Filter to visible channels only
+        let visible_indices: Vec<usize> = indices.iter()
+            .copied()
+            .filter(|&ch_idx| {
+                ch_idx < self.channels.len() &&
+                opacities.get(ch_idx).copied().unwrap_or(0.0) > 0.0
+            })
+            .collect();
+
+        let mut current_is_sub = true; // Track which texture holds the latest result
+
+        for (i, &ch_idx) in visible_indices.iter().enumerate() {
+            let channel = &self.channels[ch_idx];
+            let opacity = opacities[ch_idx];
+
+            if i == 0 {
+                // Determine starting texture based on total visible count parity
+                // so the final result always lands in sub_view.
+                // If V is odd: 1st blit to sub_view, 2nd blend ping, 3rd blend sub_view... (lands in sub_view)
+                // If V is even: 1st blit to ping, 2nd blend sub_view, 3rd blend ping, 4th blend sub_view... (lands in sub_view)
+                current_is_sub = visible_indices.len() % 2 != 0;
+                let target_view = if current_is_sub { sub_view } else { &self.effect_ping_view };
+
                 self.blit_pipeline.set_opacity(&context.queue, opacity);
                 let bind_group = self.blit_pipeline.create_bind_group(&context.device, &channel.composite_view);
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -311,7 +333,7 @@ impl Mixer {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Sub-mix Composite Pass (first)"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: sub_view,
+                            view: target_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -326,22 +348,17 @@ impl Mixer {
                     self.blit_pipeline.render(&mut render_pass, &bind_group);
                 }
                 cmd_buffers.push(encoder.finish());
-                is_first = false;
             } else {
-                // Subsequent channels: snapshot sub-mix → effect_ping, composite shader
-                let mut copy_encoder = context.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor { label: Some("Sub-mix Snapshot Copy") },
-                );
-                copy_encoder.copy_texture_to_texture(
-                    sub_tex.as_image_copy(),
-                    self.effect_ping_texture.as_image_copy(),
-                    sub_tex.size(),
-                );
-                cmd_buffers.push(copy_encoder.finish());
+                // Subsequent channels: blend channel + background → target
+                let (target_view, background_view) = if current_is_sub {
+                    (&self.effect_ping_view, sub_view)
+                } else {
+                    (sub_view, &self.effect_ping_view)
+                };
 
                 let blend_mode = channel.blend_mode;
                 self.composite_pipeline.set_params(&context.queue, opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
-                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &channel.composite_view, &self.effect_ping_view);
+                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &channel.composite_view, background_view);
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Sub-mix Composite Encoder"),
                 });
@@ -349,7 +366,7 @@ impl Mixer {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Sub-mix Composite Pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: sub_view,
+                            view: target_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -364,10 +381,11 @@ impl Mixer {
                     self.composite_pipeline.render(&mut render_pass, &bind_group);
                 }
                 cmd_buffers.push(encoder.finish());
+                current_is_sub = !current_is_sub;
             }
         }
 
-        if is_first {
+        if visible_indices.is_empty() {
             let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Sub-mix Clear Encoder"),
             });
@@ -443,15 +461,10 @@ impl Mixer {
         }
 
         if !read_from_composite {
-            let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Master Effect Final Copy Encoder"),
-            });
-            encoder.copy_texture_to_texture(
-                self.effect_ping_texture.as_image_copy(),
-                self.composite_texture.as_image_copy(),
-                self.composite_texture.size(),
-            );
-            cmd_buffers.push(encoder.finish());
+            // If result is in ping texture, swap it with composite_texture
+            // so that self.composite_view always contains the latest frame.
+            std::mem::swap(&mut self.composite_texture, &mut self.effect_ping_texture);
+            std::mem::swap(&mut self.composite_view, &mut self.effect_ping_view);
         }
 
         if !cmd_buffers.is_empty() {

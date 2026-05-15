@@ -564,4 +564,35 @@ mod tests {
         let result = crossfader * opacity;
         assert!(result.is_nan());
     }
+
+    #[test]
+    fn test_mixer_multi_channel_render_ping_pong() {
+        let gpu = headless_gpu();
+        let mut mixer = Mixer::new(&gpu, 64, 64).unwrap();
+
+        // Add 3 channels (total 5: Ch 0, Ch 1, Ch 2, Ch 3, Ch 4)
+        mixer.add_channel(&gpu, 64, 64).unwrap();
+        mixer.add_channel(&gpu, 64, 64).unwrap();
+        mixer.add_channel(&gpu, 64, 64).unwrap();
+
+        // Add one deck per channel so they have something to render
+        for i in 0..5 {
+            let deck = crate::deck::Deck::new_solid_color(&gpu, [1.0, 0.0, 0.0, 1.0], 64, 64).unwrap();
+            mixer.channel_mut(i).unwrap().add_deck(deck);
+            mixer.channel_mut(i).unwrap().opacity = 1.0;
+        }
+
+        let audio = crate::audio::AudioData::default();
+        let values = crate::modulation::AudioValues::default();
+
+        // Render should exercise the ping-pong logic in composite_channels
+        mixer.render(&gpu, &audio, &values).expect("Render failed");
+
+        // Also test sub-mix ping-pong
+        let sub_mix_sources = vec![vec![0, 1, 2]]; // 3 channels = odd
+        mixer.prepare_sub_mixes(&sub_mix_sources, &gpu);
+
+        let sub_mix_sources_even = vec![vec![0, 1, 2, 3]]; // 4 channels = even
+        mixer.prepare_sub_mixes(&sub_mix_sources_even, &gpu);
+    }
 }
