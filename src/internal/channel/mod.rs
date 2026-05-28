@@ -565,23 +565,28 @@ impl Channel {
         let width = self.composite_texture.width();
         let height = self.composite_texture.height();
         let mut composite_cmds: Vec<wgpu::CommandBuffer> = Vec::new();
+        let visible_count = ordered.len();
 
         for (i, info) in ordered.iter().enumerate() {
             let slot = &mut self.decks[info.deck_idx];
 
+            // Target final composite view if we're on the last iteration,
+            // otherwise ping-pong between effect_ping and composite_view
+            let target_view = if (visible_count - 1 - i) % 2 == 0 {
+                &self.composite_view
+            } else {
+                &self.effect_ping_view
+            };
+
             // Check if this deck is transitioning with a shader
             if let Some(progress) = info.transition_progress {
                 if let Some(effect) = slot.transition_effect.as_mut().filter(|_| i > 0) {
-                    // Snapshot composite-so-far into effect_ping_texture
-                    let mut copy_encoder = context.device.create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor { label: Some("AT Snapshot Copy") },
-                    );
-                    copy_encoder.copy_texture_to_texture(
-                        self.composite_texture.as_image_copy(),
-                        self.effect_ping_texture.as_image_copy(),
-                        self.composite_texture.size(),
-                    );
-                    composite_cmds.push(copy_encoder.finish());
+                    // Previous composite result is in the other buffer
+                    let source_view = if (visible_count - 1 - i) % 2 == 0 {
+                        &self.effect_ping_view
+                    } else {
+                        &self.composite_view
+                    };
 
                     // Run transition shader: start=deck (outgoing), end=composite-below (incoming)
                     let uniforms = ISFUniforms {
@@ -604,8 +609,8 @@ impl Channel {
                     let cmd = effect.pipeline.render_to_cmd(
                         context,
                         &slot.deck.texture_view,      // startImage: outgoing deck
-                        &self.effect_ping_view,         // endImage: composite below
-                        &self.composite_view,           // output: back to composite
+                        source_view,                  // endImage: composite below
+                        target_view,                  // output: back to composite
                         &uniforms,
                         effect.params.buffer(),
                     );
@@ -626,7 +631,7 @@ impl Channel {
                         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("Channel Composite Pass (AT fade first)"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &self.composite_view,
+                                view: target_view,
                                 resolve_target: None,
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -642,19 +647,15 @@ impl Channel {
                     }
                     composite_cmds.push(encoder.finish());
                 } else {
-                    // Subsequent decks: snapshot + composite shader
-                    let mut copy_encoder = context.device.create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor { label: Some("Composite Snapshot Copy (AT fade)") },
-                    );
-                    copy_encoder.copy_texture_to_texture(
-                        self.composite_texture.as_image_copy(),
-                        self.effect_ping_texture.as_image_copy(),
-                        self.composite_texture.size(),
-                    );
-                    composite_cmds.push(copy_encoder.finish());
+                    // Subsequent decks: blend source + previous result
+                    let source_view = if (visible_count - 1 - i) % 2 == 0 {
+                        &self.effect_ping_view
+                    } else {
+                        &self.composite_view
+                    };
 
                     self.composite_pipeline.set_params(&context.queue, fade_opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
-                    let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, &self.effect_ping_view);
+                    let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, source_view);
                     let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("Channel Composite Encoder (AT fade)"),
                     });
@@ -662,7 +663,7 @@ impl Channel {
                         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("Channel Composite Pass (AT fade)"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &self.composite_view,
+                                view: target_view,
                                 resolve_target: None,
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -693,7 +694,7 @@ impl Channel {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Channel Composite Pass (first)"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &self.composite_view,
+                            view: target_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -709,19 +710,15 @@ impl Channel {
                 }
                 composite_cmds.push(encoder.finish());
             } else {
-                // Subsequent decks: snapshot composite → ping, blend src + ping → composite
-                let mut copy_encoder = context.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor { label: Some("Composite Snapshot Copy") },
-                );
-                copy_encoder.copy_texture_to_texture(
-                    self.composite_texture.as_image_copy(),
-                    self.effect_ping_texture.as_image_copy(),
-                    self.composite_texture.size(),
-                );
-                composite_cmds.push(copy_encoder.finish());
+                // Subsequent decks: blend source + previous result
+                let source_view = if (visible_count - 1 - i) % 2 == 0 {
+                    &self.effect_ping_view
+                } else {
+                    &self.composite_view
+                };
 
                 self.composite_pipeline.set_params(&context.queue, info.opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
-                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, &self.effect_ping_view);
+                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, source_view);
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Channel Composite Encoder"),
                 });
@@ -729,7 +726,7 @@ impl Channel {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Channel Composite Pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &self.composite_view,
+                            view: target_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),

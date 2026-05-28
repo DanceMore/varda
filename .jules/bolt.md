@@ -1,0 +1,3 @@
+## 2025-05-15 - [GPU Copy Elimination in Compositing]
+**Learning:** The previous compositing logic used a "snapshot" pattern (copying the current composite to a ping-pong texture before each blend operation) to avoid simultaneous read/write on the same texture. This incurred N-1 redundant GPU-to-GPU copies for N layers. By pre-calculating parity of the visible layer count, we can alternate targets such that the final composite always lands in the intended texture without any intermediate copies.
+**Action:** Use parity-based target selection in all compositing loops (decks, channels, sub-mixes) to eliminate redundant GPU copies.

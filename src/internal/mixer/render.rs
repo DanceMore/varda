@@ -177,12 +177,23 @@ impl Mixer {
             self.channels.iter().map(|ch| ch.opacity).collect()
         };
 
-        let mut cmd_buffers = Vec::new();
-        let mut is_first = true;
-        for (_i, (channel, &opacity)) in self.channels.iter().zip(opacities.iter()).enumerate() {
-            if opacity <= 0.0 { continue; }
+        let visible_channels: Vec<_> = self.channels.iter().zip(opacities.iter())
+            .filter(|(_, &opacity)| opacity > 0.0)
+            .collect();
+        let visible_count = visible_channels.len();
 
-            if is_first {
+        let mut cmd_buffers = Vec::new();
+        for (i, (channel, &opacity)) in visible_channels.into_iter().enumerate() {
+            // Target final composite view if we're on the last iteration,
+            // otherwise ping-pong between effect_ping and composite_view
+            // based on how many channels are left to render.
+            let target_view = if (visible_count - 1 - i) % 2 == 0 {
+                &self.composite_view
+            } else {
+                &self.effect_ping_view
+            };
+
+            if i == 0 {
                 // First visible channel: simple blit copy
                 self.blit_pipeline.set_opacity(&context.queue, opacity);
                 let bind_group = self.blit_pipeline.create_bind_group(&context.device, &channel.composite_view);
@@ -193,7 +204,7 @@ impl Mixer {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Mixer Composite Pass (first)"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &self.composite_view,
+                            view: target_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -208,22 +219,17 @@ impl Mixer {
                     self.blit_pipeline.render(&mut render_pass, &bind_group);
                 }
                 cmd_buffers.push(encoder.finish());
-                is_first = false;
             } else {
-                // Subsequent channels: snapshot + composite shader
-                let mut copy_encoder = context.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor { label: Some("Mixer Snapshot Copy") },
-                );
-                copy_encoder.copy_texture_to_texture(
-                    self.composite_texture.as_image_copy(),
-                    self.effect_ping_texture.as_image_copy(),
-                    self.composite_texture.size(),
-                );
-                cmd_buffers.push(copy_encoder.finish());
+                // Subsequent channels: blend source + previous composite result
+                let source_view = if (visible_count - 1 - i) % 2 == 0 {
+                    &self.effect_ping_view
+                } else {
+                    &self.composite_view
+                };
 
                 let blend_mode = channel.blend_mode;
                 self.composite_pipeline.set_params(&context.queue, opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
-                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &channel.composite_view, &self.effect_ping_view);
+                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &channel.composite_view, source_view);
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Mixer Composite Encoder"),
                 });
@@ -231,7 +237,7 @@ impl Mixer {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Mixer Composite Pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &self.composite_view,
+                            view: target_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -292,15 +298,27 @@ impl Mixer {
             self.channels.iter().map(|ch| ch.opacity).collect()
         };
 
-        let mut cmd_buffers = Vec::new();
-        let mut is_first = true;
-        for &ch_idx in indices {
-            if ch_idx >= self.channels.len() { continue; }
-            let channel = &self.channels[ch_idx];
-            let opacity = opacities.get(ch_idx).copied().unwrap_or(0.0);
-            if opacity <= 0.0 { continue; }
+        let visible_indices: Vec<_> = indices.iter().copied()
+            .filter(|&ch_idx| {
+                ch_idx < self.channels.len() && opacities.get(ch_idx).copied().unwrap_or(0.0) > 0.0
+            })
+            .collect();
+        let visible_count = visible_indices.len();
 
-            if is_first {
+        let mut cmd_buffers = Vec::new();
+        for (i, &ch_idx) in visible_indices.iter().enumerate() {
+            let channel = &self.channels[ch_idx];
+            let opacity = opacities[ch_idx];
+
+            // Target final sub_view if we're on the last iteration,
+            // otherwise ping-pong between effect_ping and sub_view
+            let target_view = if (visible_count - 1 - i) % 2 == 0 {
+                sub_view
+            } else {
+                &self.effect_ping_view
+            };
+
+            if i == 0 {
                 // First visible channel: simple blit copy
                 self.blit_pipeline.set_opacity(&context.queue, opacity);
                 let bind_group = self.blit_pipeline.create_bind_group(&context.device, &channel.composite_view);
@@ -311,7 +329,7 @@ impl Mixer {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Sub-mix Composite Pass (first)"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: sub_view,
+                            view: target_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -326,22 +344,17 @@ impl Mixer {
                     self.blit_pipeline.render(&mut render_pass, &bind_group);
                 }
                 cmd_buffers.push(encoder.finish());
-                is_first = false;
             } else {
-                // Subsequent channels: snapshot sub-mix → effect_ping, composite shader
-                let mut copy_encoder = context.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor { label: Some("Sub-mix Snapshot Copy") },
-                );
-                copy_encoder.copy_texture_to_texture(
-                    sub_tex.as_image_copy(),
-                    self.effect_ping_texture.as_image_copy(),
-                    sub_tex.size(),
-                );
-                cmd_buffers.push(copy_encoder.finish());
+                // Subsequent channels: blend source + previous result
+                let source_view = if (visible_count - 1 - i) % 2 == 0 {
+                    &self.effect_ping_view
+                } else {
+                    sub_view
+                };
 
                 let blend_mode = channel.blend_mode;
                 self.composite_pipeline.set_params(&context.queue, opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
-                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &channel.composite_view, &self.effect_ping_view);
+                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &channel.composite_view, source_view);
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Sub-mix Composite Encoder"),
                 });
@@ -349,7 +362,7 @@ impl Mixer {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Sub-mix Composite Pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: sub_view,
+                            view: target_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -367,7 +380,7 @@ impl Mixer {
             }
         }
 
-        if is_first {
+        if visible_count == 0 {
             let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Sub-mix Clear Encoder"),
             });
