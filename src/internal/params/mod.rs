@@ -4,6 +4,7 @@ use crate::isf::ISFInput;
 use crate::modulation::ModulationEngine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 /// Cached metadata for parameter rendering/modulation to avoid HashMap lookups
@@ -474,7 +475,7 @@ impl ShaderParams {
     /// Build byte buffer with modulation applied
     /// This creates a temporary modulated value for GPU upload without modifying base values
     /// `param_prefix` is used to look up modulation (e.g., "deck0" to look up "deck0:paramname")
-    pub fn build_modulated_buffer_data(&mut self, modulation: &ModulationEngine, param_prefix: Option<&str>) -> Vec<u8> {
+    pub fn build_modulated_buffer_data(&mut self, modulation: &ModulationEngine, param_prefix: Option<&str>) -> &[u8] {
         self.ensure_caches();
 
         // Check if prefix changed before ensure_mod_keys updates it
@@ -508,7 +509,6 @@ impl ShaderParams {
         let size = self.buffer_size();
         self.data_cache.clear();
         self.data_cache.reserve(size);
-        let data = &mut self.data_cache;
 
         let mod_values = modulation.current_values();
 
@@ -521,22 +521,22 @@ impl ShaderParams {
                 ParamValue::Color(_) => 16,
             };
             // Pad to required alignment
-            while data.len() % alignment != 0 { data.push(0); }
+            while self.data_cache.len() % alignment != 0 { self.data_cache.push(0); }
 
             // Apply modulation using resolved indices (no HashMap lookups)
             if self.is_modulated[i] {
                 let modulated = self.apply_resolved_modulation(i, value, mod_values);
-                modulated.write_bytes(data);
+                modulated.write_bytes(&mut self.data_cache);
             } else {
-                value.write_bytes(data);
+                value.write_bytes(&mut self.data_cache);
             }
         }
         // Pad to minimum 16 bytes
-        while data.len() < 16 { data.push(0); }
+        while self.data_cache.len() < 16 { self.data_cache.push(0); }
         // Align to 16 bytes (uniform buffer requirement)
-        while data.len() % 16 != 0 { data.push(0); }
+        while self.data_cache.len() % 16 != 0 { self.data_cache.push(0); }
 
-        data.clone()
+        &self.data_cache
     }
 
     /// Apply pre-resolved modulation to a parameter value using direct source indexing.
@@ -612,10 +612,15 @@ impl ShaderParams {
     /// Update GPU buffer with modulation applied
     /// `param_prefix` is used to look up modulation (e.g., "deck0" to look up "deck0:paramname")
     pub fn update_buffer_with_modulation(&mut self, queue: &wgpu::Queue, modulation: &ModulationEngine, param_prefix: Option<&str>) {
-        if let Some(buffer) = &self.buffer {
-            let data = self.build_modulated_buffer_data(modulation, param_prefix);
-            queue.write_buffer(buffer, 0, &data);
-        }
+        // Clone the buffer handle (cheap Arc clone) to avoid borrow conflict with self during build_modulated_buffer_data
+        let buffer = if let Some(b) = &self.buffer {
+            b.clone()
+        } else {
+            return;
+        };
+
+        let data = self.build_modulated_buffer_data(modulation, param_prefix);
+        queue.write_buffer(&buffer, 0, data);
         // Note: we don't clear dirty flag here since base values may have changed
     }
 }
@@ -912,8 +917,8 @@ mod tests {
         let inputs = vec![make_float_input("brightness", 0.5, 0.0, 1.0)];
         let mut params = ShaderParams::from_inputs(&inputs);
         let engine = ModulationEngine::new();
-        let data = params.build_modulated_buffer_data(&engine, None);
         let base = params.build_buffer_data();
+        let data = params.build_modulated_buffer_data(&engine, None);
         assert_eq!(data, base, "No modulation should produce identical buffer");
     }
 
@@ -929,8 +934,8 @@ mod tests {
         engine.update(0.25, &crate::modulation::AudioValues::default());
         engine.assign("brightness", &uuid, 0.5, None);
 
-        let modulated = params.build_modulated_buffer_data(&engine, None);
         let base = params.build_buffer_data();
+        let modulated = params.build_modulated_buffer_data(&engine, None);
         // Modulated should differ from base (LFO at t=0.25 is non-zero)
         assert_ne!(modulated, base, "Modulated buffer should differ from base");
     }
@@ -945,8 +950,8 @@ mod tests {
         // Assign with prefix "deck0:brightness"
         engine.assign("deck0:brightness", &uuid, 0.5, None);
 
-        let modulated = params.build_modulated_buffer_data(&engine, Some("deck0"));
         let base = params.build_buffer_data();
+        let modulated = params.build_modulated_buffer_data(&engine, Some("deck0"));
         assert_ne!(modulated, base, "Prefixed modulation should apply");
     }
 
