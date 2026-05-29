@@ -108,6 +108,15 @@ pub struct ShaderParams {
     buffer: Option<wgpu::Buffer>,
     /// Buffer needs re-upload
     dirty: bool,
+    /// Cached modulation keys (e.g. "deck_uuid:param_name") to avoid per-frame allocations.
+    #[serde(skip)]
+    cached_mod_keys: Vec<String>,
+    /// The prefix used to generate `cached_mod_keys`.
+    #[serde(skip)]
+    last_mod_prefix: Option<String>,
+    /// Whether the cached keys are valid for the current prefix.
+    #[serde(skip)]
+    cached_keys_valid: bool,
 }
 
 impl ShaderParams {
@@ -135,6 +144,9 @@ impl ShaderParams {
             definitions,
             buffer: None,
             dirty: true,
+            cached_mod_keys: Vec::new(),
+            last_mod_prefix: None,
+            cached_keys_valid: false,
         }
     }
 
@@ -323,13 +335,33 @@ impl ShaderParams {
         self.dirty = true;
     }
 
+    /// Pre-format modulation keys for the current prefix.
+    /// This eliminates per-frame string allocations in the render path.
+    fn ensure_mod_keys(&mut self, param_prefix: Option<&str>) {
+        let prefix_changed = self.last_mod_prefix.as_deref() != param_prefix;
+
+        if !self.cached_keys_valid || prefix_changed {
+            self.cached_mod_keys.clear();
+            for name in &self.param_order {
+                let key = match param_prefix {
+                    Some(prefix) => format!("{}:{}", prefix, name),
+                    None => name.clone(),
+                };
+                self.cached_mod_keys.push(key);
+            }
+            self.last_mod_prefix = param_prefix.map(|s| s.to_string());
+            self.cached_keys_valid = true;
+        }
+    }
+
     /// Build byte buffer with modulation applied
     /// This creates a temporary modulated value for GPU upload without modifying base values
     /// `param_prefix` is used to look up modulation (e.g., "deck0" to look up "deck0:paramname")
-    pub fn build_modulated_buffer_data(&self, modulation: &ModulationEngine, param_prefix: Option<&str>) -> Vec<u8> {
+    pub fn build_modulated_buffer_data(&mut self, modulation: &ModulationEngine, param_prefix: Option<&str>) -> Vec<u8> {
+        self.ensure_mod_keys(param_prefix);
         let mut data = Vec::with_capacity(self.buffer_size());
 
-        for name in &self.param_order {
+        for (i, name) in self.param_order.iter().enumerate() {
             if let Some(value) = self.values.get(name) {
                 // std140 alignment rules
                 let alignment = match value {
@@ -340,8 +372,9 @@ impl ShaderParams {
                 // Pad to required alignment
                 while data.len() % alignment != 0 { data.push(0); }
 
-                // Apply modulation and write
-                let modulated = self.apply_modulation_to_value(name, value, modulation, param_prefix);
+                // Apply modulation using pre-formatted key and write
+                let mod_key = &self.cached_mod_keys[i];
+                let modulated = self.apply_modulation_to_value(name, value, modulation, mod_key);
                 modulated.write_bytes(&mut data);
             }
         }
@@ -353,20 +386,14 @@ impl ShaderParams {
     }
 
     /// Apply modulation to a parameter value
-    /// `param_prefix` is used to look up modulation (e.g., "deck0" to look up "deck0:paramname")
-    fn apply_modulation_to_value(&self, name: &str, value: &ParamValue, modulation: &ModulationEngine, param_prefix: Option<&str>) -> ParamValue {
+    /// `mod_key` is the pre-formatted lookup key (e.g. "deck0:paramname").
+    fn apply_modulation_to_value(&self, name: &str, value: &ParamValue, modulation: &ModulationEngine, mod_key: &str) -> ParamValue {
         // Get min/max from definition for clamping
         let definition = self.definitions.get(name);
 
-        // Build the full modulation key
-        let mod_key = match param_prefix {
-            Some(prefix) => format!("{}:{}", prefix, name),
-            None => name.to_string(),
-        };
-
         match value {
             ParamValue::Float(base) => {
-                let offset = modulation.get_modulation(&mod_key);
+                let offset = modulation.get_modulation(mod_key);
                 if offset == 0.0 {
                     return *value;
                 }
@@ -384,23 +411,27 @@ impl ShaderParams {
             }
             ParamValue::Color(base) => {
                 let mut result = *base;
+                let mut changed = false;
                 for i in 0..4 {
-                    let offset = modulation.get_modulation_for_component(&mod_key, Some(i));
+                    let offset = modulation.get_modulation_for_component(mod_key, Some(i));
                     if offset != 0.0 {
                         result[i] = (result[i] + offset).clamp(0.0, 1.0);
+                        changed = true;
                     }
                 }
-                ParamValue::Color(result)
+                if changed { ParamValue::Color(result) } else { *value }
             }
             ParamValue::Point2D(base) => {
                 let mut result = *base;
+                let mut changed = false;
                 for i in 0..2 {
-                    let offset = modulation.get_modulation_for_component(&mod_key, Some(i));
+                    let offset = modulation.get_modulation_for_component(mod_key, Some(i));
                     if offset != 0.0 {
                         result[i] = result[i] + offset; // Point2D can be unbounded
+                        changed = true;
                     }
                 }
-                ParamValue::Point2D(result)
+                if changed { ParamValue::Point2D(result) } else { *value }
             }
             // Bool and Long don't support continuous modulation
             _ => *value,
@@ -707,7 +738,7 @@ mod tests {
     #[test]
     fn shader_params_modulated_buffer_no_modulation() {
         let inputs = vec![make_float_input("brightness", 0.5, 0.0, 1.0)];
-        let params = ShaderParams::from_inputs(&inputs);
+        let mut params = ShaderParams::from_inputs(&inputs);
         let engine = ModulationEngine::new();
         let data = params.build_modulated_buffer_data(&engine, None);
         let base = params.build_buffer_data();
@@ -717,7 +748,7 @@ mod tests {
     #[test]
     fn shader_params_modulated_buffer_with_modulation() {
         let inputs = vec![make_float_input("brightness", 0.5, 0.0, 1.0)];
-        let params = ShaderParams::from_inputs(&inputs);
+        let mut params = ShaderParams::from_inputs(&inputs);
         let mut engine = ModulationEngine::new();
         let uuid = engine.add_source(crate::modulation::ModulationSource::LFO {
             waveform: crate::modulation::LFOWaveform::Sine,
@@ -735,7 +766,7 @@ mod tests {
     #[test]
     fn shader_params_modulated_with_prefix() {
         let inputs = vec![make_float_input("brightness", 0.5, 0.0, 1.0)];
-        let params = ShaderParams::from_inputs(&inputs);
+        let mut params = ShaderParams::from_inputs(&inputs);
         let mut engine = ModulationEngine::new();
         let uuid = engine.add_source(crate::modulation::ModulationSource::sine_lfo(1.0));
         engine.update(0.25, &crate::modulation::AudioValues::default());
