@@ -12,7 +12,7 @@ pub use transition::{
 use crate::channel::Channel;
 use crate::deck::Effect;
 use crate::modulation::ModulationEngine;
-use crate::renderer::{GpuContext, BlitPipeline, CompositeBlitPipeline};
+use crate::renderer::{GpuContext, BlitPipeline, CompositeBlitPipeline, PingPong};
 use anyhow::Result;
 
 /// Mixer - Top-level compositor
@@ -41,13 +41,10 @@ pub struct Mixer {
     /// Last render time for dt calculation
     last_render_time: std::time::Instant,
 
-    /// Composite output texture (all channels mixed, pre-master effects)
-    composite_texture: wgpu::Texture,
-    composite_view: wgpu::TextureView,
-
-    /// Ping-pong texture for master effect chain
-    effect_ping_texture: wgpu::Texture,
-    effect_ping_view: wgpu::TextureView,
+    /// Composite output (all channels mixed, then master effects), with a
+    /// ping-pong scratch target so channel-blend and the master effect chain
+    /// never snapshot-copy. Latest content is `composite.result_view()`.
+    composite: PingPong,
 
     /// Master effect chain (applied to final composite)
     master_effects: Vec<Effect>,
@@ -68,31 +65,24 @@ pub struct Mixer {
     transition_sequences: Vec<TransitionSequence>,
 
     /// Cached sub-mix textures for multi-channel surface assignments.
-    /// Key: sorted channel indices, Value: (texture, view).
-    sub_mix_cache: std::collections::HashMap<Vec<usize>, (wgpu::Texture, wgpu::TextureView)>,
+    /// Key: sorted channel indices, Value: (texture, view, scratch_texture, scratch_view).
+    /// The output (texture/view) identity must stay stable — external output
+    /// stages cache it via get_sub_mix_view — so sub-mix keeps a snapshot-copy
+    /// into its own scratch rather than ping-ponging (which would alternate the
+    /// output identity). The scratch is per-entry, sized with the output.
+    sub_mix_cache: std::collections::HashMap<Vec<usize>, (wgpu::Texture, wgpu::TextureView, wgpu::Texture, wgpu::TextureView)>,
 
     /// Per-channel culled state from the previous frame. Used to emit a
     /// one-shot clear of the composite view on the visible→culled edge,
     /// avoiding a per-frame clear submission for every culled channel.
     pub(super) prev_culled: Vec<bool>,
 
-    /// Cached bind groups for the per-channel composite blit (first channel
-    /// path) and the multi-channel composite shader (subsequent channels).
-    /// Indexed by channel index. Cleared on resize and on any channel
-    /// add/remove so a recreated TextureView never gets sampled through a
-    /// stale bind group.
-    pub(super) channel_blit_bg_cache: Vec<Option<wgpu::BindGroup>>,
-    pub(super) channel_composite_bg_cache: Vec<Option<wgpu::BindGroup>>,
 }
 
 impl Mixer {
     /// Create a new mixer with two default channels (A and B)
     pub fn new(context: &GpuContext, width: u32, height: u32) -> Result<Self> {
-        let composite_texture = context.create_render_texture(width, height);
-        let composite_view = composite_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let effect_ping_texture = context.create_render_texture(width, height);
-        let effect_ping_view = effect_ping_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let composite = PingPong::new(context, width, height);
 
         let composite_pipeline = CompositeBlitPipeline::new(&context.device, context.texture_format)?;
         let blit_pipeline = BlitPipeline::with_blend(
@@ -115,10 +105,7 @@ impl Mixer {
             modulation: ModulationEngine::new(),
             start_time: now,
             last_render_time: now,
-            composite_texture,
-            composite_view,
-            effect_ping_texture,
-            effect_ping_view,
+            composite,
             master_effects: Vec::new(),
             frame_count: 0,
             composite_pipeline,
@@ -127,17 +114,12 @@ impl Mixer {
             transition_sequences: Vec::new(),
             sub_mix_cache: std::collections::HashMap::new(),
             prev_culled: vec![false, false],
-            channel_blit_bg_cache: vec![None, None],
-            channel_composite_bg_cache: vec![None, None],
         })
     }
 
     /// Resize mixer and all channel textures
     pub fn resize(&mut self, context: &GpuContext, width: u32, height: u32) {
-        self.composite_texture = context.create_render_texture(width, height);
-        self.composite_view = self.composite_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.effect_ping_texture = context.create_render_texture(width, height);
-        self.effect_ping_view = self.effect_ping_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.composite.resize(context, width, height);
 
         for channel in &mut self.channels {
             channel.resize(context, width, height);
@@ -146,20 +128,6 @@ impl Mixer {
             effect.resize(context, width, height);
         }
         self.sub_mix_cache.clear();
-        self.invalidate_channel_bg_cache();
-    }
-
-    /// Drop cached per-channel bind groups so the next frame rebuilds them
-    /// against the current TextureViews. Must be called after any operation
-    /// that recreates a channel's composite_view or the mixer's
-    /// effect_ping_view (resize, channel add/remove, scene swap).
-    pub(super) fn invalidate_channel_bg_cache(&mut self) {
-        for slot in self.channel_blit_bg_cache.iter_mut() {
-            *slot = None;
-        }
-        for slot in self.channel_composite_bg_cache.iter_mut() {
-            *slot = None;
-        }
     }
 
     /// Clear the sub-mix texture cache (e.g. after resolution change).
@@ -189,8 +157,6 @@ impl Mixer {
         let channel = Channel::new(name, context, width, height)?;
         let idx = self.channels.len();
         self.channels.push(channel);
-        self.channel_blit_bg_cache.push(None);
-        self.channel_composite_bg_cache.push(None);
         log::info!("Added channel {} (index {})", self.channels[idx].name, idx);
         Ok(idx)
     }
@@ -213,12 +179,6 @@ impl Mixer {
         let (deck_uuids, effect_uuids) = self.channels[index].collect_modulation_uuids();
         let name = self.channels[index].name.clone();
         self.channels.remove(index);
-        if index < self.channel_blit_bg_cache.len() {
-            self.channel_blit_bg_cache.remove(index);
-        }
-        if index < self.channel_composite_bg_cache.len() {
-            self.channel_composite_bg_cache.remove(index);
-        }
         for u in &deck_uuids {
             self.modulation.remove_assignments_with_prefix(&format!("deck_{}:", u));
         }
@@ -334,7 +294,7 @@ impl Mixer {
 
     /// The composited output texture view (post-crossfade, post-master-effects).
     pub fn composite_view(&self) -> &wgpu::TextureView {
-        &self.composite_view
+        self.composite.result_view()
     }
 
     // ── UUID lookup helpers ────────────────────────────────────────────
@@ -368,8 +328,6 @@ impl Mixer {
             .unwrap_or(channels.len());
         self.next_channel_index = max_idx;
         self.channels = channels;
-        self.channel_blit_bg_cache = vec![None; self.channels.len()];
-        self.channel_composite_bg_cache = vec![None; self.channels.len()];
         self.prev_culled = vec![false; self.channels.len()];
     }
 
