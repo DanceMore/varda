@@ -6,6 +6,32 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
+/// Cached metadata for parameter rendering/modulation to avoid HashMap lookups
+#[derive(Debug, Clone)]
+struct ParamRenderInfo {
+    min: f32,
+    max: f32,
+    range: f32,
+}
+
+impl Default for ParamRenderInfo {
+    fn default() -> Self {
+        Self {
+            min: 0.0,
+            max: 1.0,
+            range: 1.0,
+        }
+    }
+}
+
+/// A resolved modulation assignment that uses a direct index into the source value vector
+#[derive(Debug, Clone)]
+struct ResolvedMod {
+    source_idx: usize,
+    amount: f32,
+    component: Option<usize>,
+}
+
 /// Parameter value types matching ISF input types
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
@@ -126,6 +152,15 @@ pub struct ShaderParams {
     /// The `ModulationEngine` version when `is_modulated` was last updated
     #[serde(skip)]
     last_mod_version: u64,
+    /// Cached min/max for float parameters
+    #[serde(skip)]
+    render_info: Vec<ParamRenderInfo>,
+    /// Resolved modulation assignments (per parameter)
+    #[serde(skip)]
+    resolved_mods: Vec<Vec<ResolvedMod>>,
+    /// Reusable byte buffer for GPU upload data
+    #[serde(skip)]
+    data_cache: Vec<u8>,
 }
 
 impl ShaderParams {
@@ -151,6 +186,21 @@ impl ShaderParams {
         }
 
         let is_modulated = vec![false; values.len()];
+        let mut render_info = vec![ParamRenderInfo::default(); values.len()];
+        let resolved_mods = vec![Vec::new(); values.len()];
+
+        // Pre-calculate render info for float parameters
+        for (i, name) in param_order.iter().enumerate() {
+            if let Some(def) = definitions.get(name) {
+                let min = def.min.unwrap_or(0.0);
+                let max = def.max.unwrap_or(1.0);
+                render_info[i] = ParamRenderInfo {
+                    min,
+                    max,
+                    range: max - min,
+                };
+            }
+        }
 
         Self {
             param_order,
@@ -164,6 +214,9 @@ impl ShaderParams {
             cached_keys_valid: false,
             is_modulated,
             last_mod_version: 0,
+            render_info,
+            resolved_mods,
+            data_cache: Vec::new(),
         }
     }
 
@@ -395,26 +448,69 @@ impl ShaderParams {
         }
     }
 
+    /// Ensure all cached vectors are correctly sized and populated.
+    /// This handles the case where the struct was deserialized (skipping these fields).
+    fn ensure_caches(&mut self) {
+        let n = self.values.len();
+        if self.is_modulated.len() != n { self.is_modulated = vec![false; n]; }
+        if self.resolved_mods.len() != n { self.resolved_mods = vec![Vec::new(); n]; }
+
+        if self.render_info.len() != n {
+            self.render_info = vec![ParamRenderInfo::default(); n];
+            for (i, name) in self.param_order.iter().enumerate() {
+                if let Some(def) = self.definitions.get(name) {
+                    let min = def.min.unwrap_or(0.0);
+                    let max = def.max.unwrap_or(1.0);
+                    self.render_info[i] = ParamRenderInfo {
+                        min,
+                        max,
+                        range: max - min,
+                    };
+                }
+            }
+        }
+    }
+
     /// Build byte buffer with modulation applied
     /// This creates a temporary modulated value for GPU upload without modifying base values
     /// `param_prefix` is used to look up modulation (e.g., "deck0" to look up "deck0:paramname")
     pub fn build_modulated_buffer_data(&mut self, modulation: &ModulationEngine, param_prefix: Option<&str>) -> Vec<u8> {
+        self.ensure_caches();
+
         // Check if prefix changed before ensure_mod_keys updates it
         let prefix_changed = self.last_mod_prefix.as_deref() != param_prefix;
         self.ensure_mod_keys(param_prefix);
 
         // Refresh modulation cache if version or prefix changed.
-        // We only perform the expensive ModulationEngine hash lookups when the
-        // topology changes (version increment) or the entity is re-prefixed.
+        // We resolve all active modulations to direct source indices to eliminate
+        // HashMap lookups in the hot loop.
         if self.last_mod_version != modulation.version || prefix_changed {
             for (i, _name) in self.param_order.iter().enumerate() {
                 let mod_key = &self.cached_mod_keys[i];
                 self.is_modulated[i] = modulation.has_modulation(mod_key);
+
+                self.resolved_mods[i].clear();
+                if let Some(assignments) = modulation.assignments.get(mod_key) {
+                    for m in assignments {
+                        if let Some(src_idx) = modulation.sources.iter().position(|e| e.uuid == m.source_id) {
+                            self.resolved_mods[i].push(ResolvedMod {
+                                source_idx: src_idx,
+                                amount: m.amount,
+                                component: m.component,
+                            });
+                        }
+                    }
+                }
             }
             self.last_mod_version = modulation.version;
         }
 
-        let mut data = Vec::with_capacity(self.buffer_size());
+        let size = self.buffer_size();
+        self.data_cache.clear();
+        self.data_cache.reserve(size);
+        let data = &mut self.data_cache;
+
+        let mod_values = modulation.current_values();
 
         for i in 0..self.values.len() {
             let value = &self.values[i];
@@ -427,55 +523,64 @@ impl ShaderParams {
             // Pad to required alignment
             while data.len() % alignment != 0 { data.push(0); }
 
-            // Skip modulation lookup if we know it's not modulated
+            // Apply modulation using resolved indices (no HashMap lookups)
             if self.is_modulated[i] {
-                let name = &self.param_order[i];
-                let mod_key = &self.cached_mod_keys[i];
-                let modulated = self.apply_modulation_to_value(name, value, modulation, mod_key);
-                modulated.write_bytes(&mut data);
+                let modulated = self.apply_resolved_modulation(i, value, mod_values);
+                modulated.write_bytes(data);
             } else {
-                value.write_bytes(&mut data);
+                value.write_bytes(data);
             }
         }
         // Pad to minimum 16 bytes
         while data.len() < 16 { data.push(0); }
         // Align to 16 bytes (uniform buffer requirement)
         while data.len() % 16 != 0 { data.push(0); }
-        data
+
+        data.clone()
     }
 
-    /// Apply modulation to a parameter value
-    /// `mod_key` is the pre-formatted lookup key (e.g. "deck0:paramname").
-    fn apply_modulation_to_value(&self, name: &str, value: &ParamValue, modulation: &ModulationEngine, mod_key: &str) -> ParamValue {
-        // Get min/max from definition for clamping
-        let definition = self.definitions.get(name);
+    /// Apply pre-resolved modulation to a parameter value using direct source indexing.
+    fn apply_resolved_modulation(&self, idx: usize, value: &ParamValue, mod_values: &[f32]) -> ParamValue {
+        let resolved = &self.resolved_mods[idx];
+        if resolved.is_empty() {
+            return *value;
+        }
 
         match value {
             ParamValue::Float(base) => {
-                let offset = modulation.get_modulation(mod_key);
+                let mut offset = 0.0;
+                for m in resolved {
+                    if let Some(val) = mod_values.get(m.source_idx) {
+                        offset += val * m.amount;
+                    }
+                }
+
                 if offset == 0.0 {
                     return *value;
                 }
-                // Get range from definition
-                let (min_val, max_val) = definition
-                    .map(|d| {
-                        let min = d.min.unwrap_or(0.0);
-                        let max = d.max.unwrap_or(1.0);
-                        (min, max)
-                    })
-                    .unwrap_or((0.0, 1.0));
-                let range = max_val - min_val;
-                let modulated = (base + offset * range).clamp(min_val, max_val);
+
+                let info = &self.render_info[idx];
+                let modulated = (base + offset * info.range).clamp(info.min, info.max);
                 ParamValue::Float(modulated)
             }
             ParamValue::Color(base) => {
                 let mut result = *base;
                 let mut changed = false;
-                for i in 0..4 {
-                    let offset = modulation.get_modulation_for_component(mod_key, Some(i));
-                    if offset != 0.0 {
-                        result[i] = (result[i] + offset).clamp(0.0, 1.0);
-                        changed = true;
+
+                for m in resolved {
+                    if let Some(val) = mod_values.get(m.source_idx) {
+                        if let Some(comp_idx) = m.component {
+                            if comp_idx < 4 {
+                                result[comp_idx] = (result[comp_idx] + val * m.amount).clamp(0.0, 1.0);
+                                changed = true;
+                            }
+                        } else {
+                            // Scalar modulation applied to all RGB components
+                            for j in 0..3 {
+                                result[j] = (result[j] + val * m.amount).clamp(0.0, 1.0);
+                            }
+                            changed = true;
+                        }
                     }
                 }
                 if changed { ParamValue::Color(result) } else { *value }
@@ -483,16 +588,23 @@ impl ShaderParams {
             ParamValue::Point2D(base) => {
                 let mut result = *base;
                 let mut changed = false;
-                for i in 0..2 {
-                    let offset = modulation.get_modulation_for_component(mod_key, Some(i));
-                    if offset != 0.0 {
-                        result[i] = result[i] + offset; // Point2D can be unbounded
-                        changed = true;
+
+                for m in resolved {
+                    if let Some(val) = mod_values.get(m.source_idx) {
+                        if let Some(comp_idx) = m.component {
+                            if comp_idx < 2 {
+                                result[comp_idx] += val * m.amount;
+                                changed = true;
+                            }
+                        } else {
+                            result[0] += val * m.amount;
+                            result[1] += val * m.amount;
+                            changed = true;
+                        }
                     }
                 }
                 if changed { ParamValue::Point2D(result) } else { *value }
             }
-            // Bool and Long don't support continuous modulation
             _ => *value,
         }
     }
