@@ -20,6 +20,14 @@ pub struct ModulationEngine {
     current_values: Vec<f32>,
     #[serde(skip)]
     prev_time: Option<f32>,
+    /// Cached topological evaluation order. Rebuilt when sources or
+    /// assignments mutate; otherwise reused across frames so the per-frame
+    /// tick stops doing an O(N²·MAX_MOD_DEPTH) re-sort that produces the
+    /// same result.
+    #[serde(skip)]
+    cached_order: Vec<usize>,
+    #[serde(skip)]
+    cached_order_valid: bool,
 }
 
 impl ModulationEngine {
@@ -47,6 +55,7 @@ impl ModulationEngine {
         self.prev_values.push(0.0);
         self.current_values.push(0.0);
         self.uuid_to_idx.insert(uuid.clone(), self.sources.len() - 1);
+        self.invalidate_evaluation_order();
         uuid
     }
 
@@ -57,6 +66,7 @@ impl ModulationEngine {
         self.prev_values.push(0.0);
         self.current_values.push(0.0);
         self.uuid_to_idx.insert(uuid.clone(), self.sources.len() - 1);
+        self.invalidate_evaluation_order();
         uuid
     }
 
@@ -74,6 +84,7 @@ impl ModulationEngine {
             let mod_prefix = format!("mod:{}:", uuid);
             self.assignments.retain(|k, _| !k.starts_with(&mod_prefix));
             self.rebuild_uuid_index();
+            self.invalidate_evaluation_order();
         }
     }
 
@@ -85,6 +96,7 @@ impl ModulationEngine {
         let removed = before - self.assignments.len();
         if removed > 0 {
             log::info!("Removed {} orphaned modulation assignments with prefix '{}'", removed, prefix);
+            self.invalidate_evaluation_order();
         }
     }
 
@@ -95,6 +107,10 @@ impl ModulationEngine {
         }
         let modulation = ParamModulation { source_id: source_id.to_string(), amount, component };
         self.assignments.entry(param_name.to_string()).or_default().push(modulation);
+        // Only mod-on-mod assignments alter the topology; non-mod assignments
+        // don't change evaluation order but invalidating universally keeps
+        // the cache invariant simple.
+        self.invalidate_evaluation_order();
     }
 
     pub fn assign_mod_on_mod(&mut self, target_uuid: &str, param_name: &str, modulator_uuid: &str, amount: f32) {
@@ -105,10 +121,12 @@ impl ModulationEngine {
     pub fn clear_mod_on_mod(&mut self, target_uuid: &str, param_name: &str) {
         let key = format!("mod:{}:{}", target_uuid, param_name);
         self.assignments.remove(&key);
+        self.invalidate_evaluation_order();
     }
 
     pub fn clear_assignments(&mut self, param_name: &str) {
         self.assignments.remove(param_name);
+        self.invalidate_evaluation_order();
     }
 
     pub fn trigger_adsr(&mut self, uuid: &str) {
@@ -169,10 +187,29 @@ impl ModulationEngine {
         modified
     }
 
-    pub(crate) fn evaluation_order(&self) -> Vec<usize> {
+    /// Mark the cached evaluation order stale. Call from every mutation that
+    /// can affect topology: source add/remove, assignment add/remove/clear,
+    /// or any code path that reorders `self.sources`.
+    pub(crate) fn invalidate_evaluation_order(&mut self) {
+        self.cached_order_valid = false;
+    }
+
+    /// Topological evaluation order honoring mod-on-mod dependencies.
+    /// Result is cached and reused across frames; mutators must call
+    /// `invalidate_evaluation_order()` after touching `sources` or
+    /// `assignments`.
+    pub(crate) fn evaluation_order(&mut self) -> Vec<usize> {
+        if self.cached_order_valid && self.cached_order.len() == self.sources.len() {
+            return self.cached_order.clone();
+        }
+
         const MAX_MOD_DEPTH: usize = 4;
         let n = self.sources.len();
-        if n == 0 { return vec![]; }
+        self.cached_order.clear();
+        if n == 0 {
+            self.cached_order_valid = true;
+            return Vec::new();
+        }
 
         let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (key, mods) in &self.assignments {
@@ -206,6 +243,8 @@ impl ModulationEngine {
         for i in 0..n {
             if !evaluated[i] { order.push(i); }
         }
+        self.cached_order = order.clone();
+        self.cached_order_valid = true;
         order
     }
 

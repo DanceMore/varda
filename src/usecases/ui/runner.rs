@@ -131,6 +131,12 @@ pub struct UIRunner {
     history: HistoryManager,
 
     // ── Performance: gate publish_state to reduce snapshot overhead ──
+    //
+    // Cadence is `% PUBLISH_EVERY_N_FRAMES` against `publish_counter`. The
+    // old /10 (≈6Hz at 60fps) was visibly choppy for remote clients on top
+    // of the 33ms WS delta interval; /2 (≈30Hz) matches the WS interval and
+    // keeps remote UI fluid without inflating snapshot cost much (the WS
+    // layer still coalesces per its own interval).
     publish_counter: u32,
 
     // ── HTTP API server (background thread) ──────────────────────────
@@ -549,7 +555,7 @@ impl UIRunner {
         // Render output windows + publish state
         varda.render_outputs();
         self.publish_counter += 1;
-        if self.publish_counter % 10 == 0 {
+        if self.publish_counter % 2 == 0 {
             varda.publish_state();
         }
     }
@@ -1078,7 +1084,7 @@ impl UIRunner {
             varda.set_domemaster_content_rotation(c_az, c_el, c_roll);
             varda.render_outputs();
             self.publish_counter += 1;
-            if self.publish_counter % 10 == 0 {
+            if self.publish_counter % 2 == 0 {
                 varda.publish_state();
             }
         }

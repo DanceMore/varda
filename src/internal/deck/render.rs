@@ -12,8 +12,14 @@ use crate::renderer::BlitPipeline;
 use super::{Deck, DeckSource, ScalingMode, PassBuffer};
 
 /// Accumulate phase times: for each PhaseInput, adds `dt * param_value * scale` to the accumulator.
+///
+/// Accumulators are f64 to fight long-run resolution loss: f32 starts losing
+/// per-tick precision around 100k seconds (~28h), which froze phase-driven
+/// animations in long installations. Values are downcast to f32 only at the
+/// GPU uniform boundary, where wrap-arounds inside the visible range are
+/// fine for the cyclic shader uses (sin/cos/fract).
 fn accumulate_phase_times(
-    accumulators: &mut [f32; 4],
+    accumulators: &mut [f64; 4],
     dt: f32,
     phase_inputs: Option<&[PhaseInput]>,
     params: &ShaderParams,
@@ -22,10 +28,27 @@ fn accumulate_phase_times(
         for pi in inputs {
             if pi.index < 4 {
                 let param_val = params.get_float(&pi.param).unwrap_or(1.0);
-                accumulators[pi.index] += dt * param_val * pi.scale;
+                accumulators[pi.index] += (dt as f64) * (param_val as f64) * (pi.scale as f64);
             }
         }
     }
+}
+
+/// Downcast an f64 phase accumulator to f32 for GPU upload. Subtracts a
+/// multiple of TAU so the f32 result stays in a range where its precision
+/// is acceptable for cyclic shader math.
+fn phase_to_f32(p: f64) -> f32 {
+    use std::f64::consts::TAU;
+    p.rem_euclid(TAU * 1024.0) as f32
+}
+
+fn phase_array_to_f32(accum: &[f64; 4]) -> [f32; 4] {
+    [
+        phase_to_f32(accum[0]),
+        phase_to_f32(accum[1]),
+        phase_to_f32(accum[2]),
+        phase_to_f32(accum[3]),
+    ]
 }
 
 impl Deck {
@@ -132,7 +155,7 @@ impl Deck {
             self.generator_phase_inputs.as_deref(),
             &self.generator_params,
         );
-        let generator_phase_times = self.phase_accumulators;
+        let generator_phase_times = phase_array_to_f32(&self.phase_accumulators);
 
         let enabled_effects: Vec<usize> = self.effects.iter()
             .enumerate()
@@ -149,10 +172,18 @@ impl Deck {
                     .iter()
                     .map(|(_, _, v)| v)
                     .collect();
+                // Frame count is tracked as u64 to avoid the ~13-day wrap at
+                // 60fps (or ~5h once SIMULATION_ITERATIONS multiplies it);
+                // ISFUniforms.frame_index is u32 (std140 GPU layout) so cast
+                // at the boundary. Wraparound at the cast still produces the
+                // MAX→0 jump documented in bug-hunt-2025-05 #10, but only
+                // after ~828 days of continuous render — long enough that
+                // host-side counters and multiplications stay correct.
+                let frame_u32 = self.frame_count as u32;
                 if pipeline.num_pass_buffers > 0 {
                     Self::render_multi_pass_static(
                         context, pipeline, passes, pass_buffers,
-                        time, time_delta, self.frame_count,
+                        time, time_delta, frame_u32,
                         self.texture.width(), self.texture.height(),
                         generator_target, audio_data,
                         &mut self.generator_params, modulation, &param_prefix,
@@ -163,7 +194,7 @@ impl Deck {
                 } else {
                     Self::render_simple_static(
                         context, pipeline, &self.texture,
-                        time, time_delta, self.frame_count, generator_target, audio_data,
+                        time, time_delta, frame_u32, generator_target, audio_data,
                         &mut self.generator_params, modulation, &param_prefix,
                         &imported_views,
                         generator_phase_times,
@@ -306,12 +337,12 @@ impl Deck {
                 effect.phase_inputs_config.as_deref(),
                 &effect.params,
             );
-            let effect_phase_times = effect.phase_accumulators;
+            let effect_phase_times = phase_array_to_f32(&effect.phase_accumulators);
 
             let uniforms = ISFUniforms {
                 time,
                 time_delta,
-                frame_index: self.frame_count,
+                frame_index: self.frame_count as u32,
                 pass_index: 0,
                 render_size: [self.texture.width() as f32, self.texture.height() as f32],
                 audio_level: audio_data.level,
@@ -328,7 +359,7 @@ impl Deck {
             } else {
                 (&self.texture_view, &self.texture_b_view)
             };
-            let fx_prefix = format!("fx_{}", self.effects[effect_idx].uuid);
+            let fx_prefix = self.effects[effect_idx].mod_prefix.clone();
             self.effects[effect_idx].apply_with_modulation(
                 context, input_view, output_view, &uniforms,
                 Some(modulation), Some(&fx_prefix),
@@ -379,9 +410,11 @@ impl Deck {
         generator_params.update_buffer_with_modulation(&context.queue, modulation, Some(param_prefix));
 
         let user_params_buffer = generator_params.buffer().expect("Buffer should exist after ensure_buffer");
-        let bind_group = pipeline.create_bind_group(
+        let Some(bind_group) = pipeline.create_bind_group(
             &context.device, None, &[], imported_views, Some(user_params_buffer),
-        );
+        ) else {
+            return Ok(());
+        };
 
         let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Deck Source Render Encoder"),
@@ -496,7 +529,9 @@ impl Deck {
                     .map(|pb| pb.read_view())
                     .collect();
 
-                let bind_group = multi_pass.create_bind_group(&context.device, None, &pass_buffer_views, imported_views, Some(user_params_buffer));
+                let Some(bind_group) = multi_pass.create_bind_group(&context.device, None, &pass_buffer_views, imported_views, Some(user_params_buffer)) else {
+                    continue;
+                };
 
                 let target_view = pass_buffers.get(target_name)
                     .map(|pb| pb.write_view())
@@ -565,7 +600,9 @@ impl Deck {
                 .map(|pb| pb.read_view())
                 .collect();
 
-            let bind_group = multi_pass.create_bind_group(&context.device, None, &pass_buffer_views, imported_views, Some(user_params_buffer));
+            let Some(bind_group) = multi_pass.create_bind_group(&context.device, None, &pass_buffer_views, imported_views, Some(user_params_buffer)) else {
+                return Ok(());
+            };
 
             let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Final Pass Encoder"),
@@ -667,6 +704,9 @@ impl Deck {
             view_formats: &[],
         });
         self.texture_b_view = self.texture_b.create_view(&wgpu::TextureViewDescriptor::default());
+        for effect in self.effects.iter_mut() {
+            effect.resize(context, width, height);
+        }
     }
 
     /// Get the final output texture view (after effect chain)
@@ -675,7 +715,13 @@ impl Deck {
     }
 }
 
-/// Get current date as [year, month, day, seconds_in_day]
+/// Get current date as [year, month, day, seconds_in_day].
+///
+/// Uses Howard Hinnant's proleptic-Gregorian `civil_from_days` algorithm, which
+/// is correct for every year/month/day including leap years and the
+/// 100/400-year leap rules — the previous approximation (months = 30d,
+/// year = 365.25d) drifted up to several days per month, so the ISF DATE
+/// uniform handed shaders wrong values most of the time.
 pub fn get_current_date() -> [f32; 4] {
     use std::time::SystemTime;
 
@@ -683,16 +729,93 @@ pub fn get_current_date() -> [f32; 4] {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
 
-    let total_seconds = now.as_secs();
-    let seconds_in_day = (total_seconds % 86400) as f32;
+    let total_seconds = now.as_secs() as i64;
+    let seconds_in_day = (total_seconds.rem_euclid(86400)) as f32;
+    let days_since_epoch = total_seconds.div_euclid(86400);
 
-    let days_since_epoch = total_seconds / 86400;
-    let year = 1970.0 + (days_since_epoch as f32 / 365.25);
-    let day_of_year = (days_since_epoch % 365) as f32;
-    let month = (day_of_year / 30.0).floor() + 1.0;
-    let day = (day_of_year % 30.0) + 1.0;
+    // civil_from_days, see https://howardhinnant.github.io/date_algorithms.html
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
 
-    [year, month, day, seconds_in_day]
+    [y as f32, m as f32, d as f32, seconds_in_day]
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::get_current_date;
+
+    fn date_from_unix(secs: u64) -> [f32; 4] {
+        // Replicate get_current_date but feeding a known timestamp
+        let total_seconds = secs as i64;
+        let seconds_in_day = (total_seconds.rem_euclid(86400)) as f32;
+        let days_since_epoch = total_seconds.div_euclid(86400);
+        let z = days_since_epoch + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let mut y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        if m <= 2 {
+            y += 1;
+        }
+        [y as f32, m as f32, d as f32, seconds_in_day]
+    }
+
+    #[test]
+    fn epoch_is_1970_01_01() {
+        let d = date_from_unix(0);
+        assert_eq!(d[0] as i64, 1970);
+        assert_eq!(d[1] as i64, 1);
+        assert_eq!(d[2] as i64, 1);
+    }
+
+    #[test]
+    fn leap_day_2024_02_29() {
+        // 2024-02-29 00:00:00 UTC = 1709164800
+        let d = date_from_unix(1_709_164_800);
+        assert_eq!(d[0] as i64, 2024);
+        assert_eq!(d[1] as i64, 2);
+        assert_eq!(d[2] as i64, 29);
+    }
+
+    #[test]
+    fn day_after_leap_is_march_1() {
+        let d = date_from_unix(1_709_164_800 + 86_400);
+        assert_eq!(d[0] as i64, 2024);
+        assert_eq!(d[1] as i64, 3);
+        assert_eq!(d[2] as i64, 1);
+    }
+
+    #[test]
+    fn dec_31_handles_year_boundary() {
+        // 2023-12-31 00:00:00 UTC = 1703980800
+        let d = date_from_unix(1_703_980_800);
+        assert_eq!(d[0] as i64, 2023);
+        assert_eq!(d[1] as i64, 12);
+        assert_eq!(d[2] as i64, 31);
+    }
+
+    #[test]
+    fn smoke_check_now_is_sane() {
+        let [y, m, d, s] = get_current_date();
+        assert!(y >= 2024.0 && y < 2200.0, "year {} out of range", y);
+        assert!(m >= 1.0 && m <= 12.0, "month {} out of range", m);
+        assert!(d >= 1.0 && d <= 31.0, "day {} out of range", d);
+        assert!(s >= 0.0 && s < 86_400.0, "seconds {} out of range", s);
+    }
 }
 
 #[cfg(test)]
@@ -713,7 +836,7 @@ mod tests {
 
     #[test]
     fn accumulate_phase_times_basic() {
-        let mut accum = [0.0f32; 4];
+        let mut accum = [0.0f64; 4];
         let inputs = vec![
             PhaseInput { param: "speed".into(), index: 0, scale: 1.0 },
         ];
@@ -737,7 +860,7 @@ mod tests {
 
     #[test]
     fn accumulate_phase_times_with_scale() {
-        let mut accum = [0.0f32; 4];
+        let mut accum = [0.0f64; 4];
         let inputs = vec![
             PhaseInput { param: "speed".into(), index: 0, scale: 0.3 },
         ];
@@ -756,7 +879,7 @@ mod tests {
 
     #[test]
     fn accumulate_phase_times_speed_change_is_continuous() {
-        let mut accum = [0.0f32; 4];
+        let mut accum = [0.0f64; 4];
         let inputs = vec![
             PhaseInput { param: "speed".into(), index: 0, scale: 1.0 },
         ];
@@ -788,7 +911,7 @@ mod tests {
 
     #[test]
     fn accumulate_phase_times_multi_index() {
-        let mut accum = [0.0f32; 4];
+        let mut accum = [0.0f64; 4];
         let inputs = vec![
             PhaseInput { param: "speed".into(), index: 0, scale: 1.0 },
             PhaseInput { param: "rot_x".into(), index: 1, scale: 1.0 },
@@ -820,7 +943,7 @@ mod tests {
 
     #[test]
     fn accumulate_phase_times_none_is_noop() {
-        let mut accum = [0.0f32; 4];
+        let mut accum = [0.0f64; 4];
         let params = ShaderParams::from_inputs(&[]);
         accumulate_phase_times(&mut accum, 0.1, None, &params);
         assert_eq!(accum, [0.0; 4]);

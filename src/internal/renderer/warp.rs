@@ -286,13 +286,21 @@ impl WarpMesh {
         let expected = (cols * rows) as usize;
         let mut points = Vec::with_capacity(expected);
 
-        for line in lines {
+        for (line_idx, line) in lines.enumerate() {
             let vals: Vec<f32> = line.split(|c: char| c == ',' || c.is_whitespace())
                 .filter(|s| !s.is_empty())
                 .filter_map(|s| s.parse().ok())
                 .collect();
             if vals.len() < 4 {
                 continue; // skip malformed lines
+            }
+            // Reject NaN/Inf — these would otherwise reach the GPU vertex
+            // buffer and produce missing/corrupt geometry.
+            if !vals[..4].iter().all(|v| v.is_finite()) {
+                anyhow::bail!(
+                    "XYUV CSV: non-finite value in line {} (position {:?}, uv {:?})",
+                    line_idx, &vals[..2], &vals[2..4]
+                );
             }
             points.push(MeshPoint {
                 position: [vals[0], vals[1]],

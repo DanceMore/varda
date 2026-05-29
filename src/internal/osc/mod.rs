@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::net::{SocketAddrV4, UdpSocket};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::thread;
 
@@ -141,7 +143,8 @@ pub fn parse_osc_message(addr: &str, args: &[OscType]) -> OscInput {
 /// OSC receiver — background thread listening on a UDP port.
 pub struct OscReceiver {
     receiver: Receiver<OscInput>,
-    _thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl OscReceiver {
@@ -156,28 +159,32 @@ impl OscReceiver {
         let (sender, receiver) = channel();
         log::info!("OSC receiver listening on port {}", port);
 
-        let _thread = thread::spawn(move || {
-            Self::receive_loop(socket, sender);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let thread = thread::spawn(move || {
+            Self::receive_loop(socket, sender, shutdown_clone);
         });
-        Ok(Self { receiver, _thread })
+        Ok(Self { receiver, thread: Some(thread), shutdown })
     }
 
-    fn receive_loop(socket: UdpSocket, sender: Sender<OscInput>) {
+    fn receive_loop(socket: UdpSocket, sender: Sender<OscInput>, shutdown: Arc<AtomicBool>) {
         let mut buf = [0u8; rosc::decoder::MTU];
-        loop {
+        while !shutdown.load(Ordering::Relaxed) {
             match socket.recv_from(&mut buf) {
                 Ok((size, _addr)) => {
                     if let Ok((_, packet)) = rosc::decoder::decode_udp(&buf[..size]) {
                         Self::handle_packet(packet, &sender);
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                           || e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => {
                     log::error!("OSC receive error: {}", e);
                     break;
                 }
             }
         }
+        log::info!("OSC receive loop exiting");
     }
 
     fn handle_packet(packet: OscPacket, sender: &Sender<OscInput>) {
@@ -202,6 +209,22 @@ impl OscReceiver {
             Ok(input) => Some(input),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => None,
+        }
+    }
+}
+
+impl Drop for OscReceiver {
+    fn drop(&mut self) {
+        // Signal the receive loop to exit; the 100ms socket read timeout
+        // means the thread observes shutdown within one polling cycle.
+        // Without this, dropping an OscReceiver (e.g. on port change or
+        // app shutdown) leaked the thread and held the UDP port until the
+        // process exited.
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            if let Err(e) = handle.join() {
+                log::warn!("OSC receive thread join failed: {:?}", e);
+            }
         }
     }
 }

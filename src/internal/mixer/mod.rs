@@ -53,7 +53,7 @@ pub struct Mixer {
     master_effects: Vec<Effect>,
 
     /// Frame counter
-    frame_count: u32,
+    frame_count: u64,
 
     /// Shader-based composite pipeline for blending channels (all blend modes via uniform)
     composite_pipeline: CompositeBlitPipeline,
@@ -70,6 +70,19 @@ pub struct Mixer {
     /// Cached sub-mix textures for multi-channel surface assignments.
     /// Key: sorted channel indices, Value: (texture, view).
     sub_mix_cache: std::collections::HashMap<Vec<usize>, (wgpu::Texture, wgpu::TextureView)>,
+
+    /// Per-channel culled state from the previous frame. Used to emit a
+    /// one-shot clear of the composite view on the visible→culled edge,
+    /// avoiding a per-frame clear submission for every culled channel.
+    pub(super) prev_culled: Vec<bool>,
+
+    /// Cached bind groups for the per-channel composite blit (first channel
+    /// path) and the multi-channel composite shader (subsequent channels).
+    /// Indexed by channel index. Cleared on resize and on any channel
+    /// add/remove so a recreated TextureView never gets sampled through a
+    /// stale bind group.
+    pub(super) channel_blit_bg_cache: Vec<Option<wgpu::BindGroup>>,
+    pub(super) channel_composite_bg_cache: Vec<Option<wgpu::BindGroup>>,
 }
 
 impl Mixer {
@@ -113,6 +126,9 @@ impl Mixer {
             active_transition: None,
             transition_sequences: Vec::new(),
             sub_mix_cache: std::collections::HashMap::new(),
+            prev_culled: vec![false, false],
+            channel_blit_bg_cache: vec![None, None],
+            channel_composite_bg_cache: vec![None, None],
         })
     }
 
@@ -126,7 +142,24 @@ impl Mixer {
         for channel in &mut self.channels {
             channel.resize(context, width, height);
         }
+        for effect in self.master_effects.iter_mut() {
+            effect.resize(context, width, height);
+        }
         self.sub_mix_cache.clear();
+        self.invalidate_channel_bg_cache();
+    }
+
+    /// Drop cached per-channel bind groups so the next frame rebuilds them
+    /// against the current TextureViews. Must be called after any operation
+    /// that recreates a channel's composite_view or the mixer's
+    /// effect_ping_view (resize, channel add/remove, scene swap).
+    pub(super) fn invalidate_channel_bg_cache(&mut self) {
+        for slot in self.channel_blit_bg_cache.iter_mut() {
+            *slot = None;
+        }
+        for slot in self.channel_composite_bg_cache.iter_mut() {
+            *slot = None;
+        }
     }
 
     /// Clear the sub-mix texture cache (e.g. after resolution change).
@@ -156,20 +189,75 @@ impl Mixer {
         let channel = Channel::new(name, context, width, height)?;
         let idx = self.channels.len();
         self.channels.push(channel);
+        self.channel_blit_bg_cache.push(None);
+        self.channel_composite_bg_cache.push(None);
         log::info!("Added channel {} (index {})", self.channels[idx].name, idx);
         Ok(idx)
     }
 
     /// Remove a channel by index. Returns true if removed.
     /// Cannot remove below 2 channels (minimum A and B).
+    ///
+    /// Also purges modulation assignments addressing decks/effects owned by the
+    /// channel, and fixes up TransitionSequence step indices that referenced
+    /// the removed channel (later indices shift down; sequences with steps
+    /// that referenced the removed channel directly are disabled).
+    ///
+    /// Note: external resources held by decks in this channel (cameras, NDI,
+    /// SRT, Syphon) MUST be released by the caller before invoking this — see
+    /// `release_channel_external_resources` patterns at the engine layer.
     pub fn remove_channel(&mut self, index: usize) -> bool {
         if self.channels.len() <= 2 || index >= self.channels.len() {
             return false;
         }
+        let (deck_uuids, effect_uuids) = self.channels[index].collect_modulation_uuids();
         let name = self.channels[index].name.clone();
         self.channels.remove(index);
-        log::info!("Removed channel {} (was index {})", name, index);
+        if index < self.channel_blit_bg_cache.len() {
+            self.channel_blit_bg_cache.remove(index);
+        }
+        if index < self.channel_composite_bg_cache.len() {
+            self.channel_composite_bg_cache.remove(index);
+        }
+        for u in &deck_uuids {
+            self.modulation.remove_assignments_with_prefix(&format!("deck_{}:", u));
+        }
+        for u in &effect_uuids {
+            self.modulation.remove_assignments_with_prefix(&format!("fx_{}:", u));
+        }
+        self.fixup_transition_sequences_after_channel_remove(index);
+        log::info!(
+            "Removed channel {} (was index {}); purged {} deck + {} effect modulation entries",
+            name, index, deck_uuids.len(), effect_uuids.len()
+        );
         true
+    }
+
+    /// Adjust TransitionSequence step channel indices after a channel was removed
+    /// at `removed_idx`. Steps that referenced the removed channel cause the
+    /// sequence to be disabled (and a warning logged). Indices > removed_idx
+    /// shift down by one.
+    pub(crate) fn fixup_transition_sequences_after_channel_remove(&mut self, removed_idx: usize) {
+        for seq in self.transition_sequences.iter_mut() {
+            let mut had_orphan = false;
+            for step in seq.steps.iter_mut() {
+                if let StepKind::Fade { from_ch, to_ch, .. } = &mut step.kind {
+                    if *from_ch == removed_idx || *to_ch == removed_idx {
+                        had_orphan = true;
+                    }
+                    if *from_ch > removed_idx { *from_ch -= 1; }
+                    if *to_ch > removed_idx { *to_ch -= 1; }
+                }
+            }
+            if had_orphan && seq.enabled {
+                log::warn!(
+                    "Disabling transition sequence '{}': it referenced the removed channel {}",
+                    seq.name, removed_idx
+                );
+                seq.enabled = false;
+                seq.state.reset();
+            }
+        }
     }
 
     /// Get a reference to channel by index
@@ -280,6 +368,9 @@ impl Mixer {
             .unwrap_or(channels.len());
         self.next_channel_index = max_idx;
         self.channels = channels;
+        self.channel_blit_bg_cache = vec![None; self.channels.len()];
+        self.channel_composite_bg_cache = vec![None; self.channels.len()];
+        self.prev_culled = vec![false; self.channels.len()];
     }
 
     /// Set the crossfader position directly (used by persistence restore).
@@ -465,6 +556,70 @@ mod tests {
         assert_eq!(channel_name(0), "Ch 0");
         assert_eq!(channel_name(1), "Ch 1");
         assert_eq!(channel_name(42), "Ch 42");
+    }
+
+    // ── TransitionSequence index-fixup tests ─────────────────────────
+    //
+    // Validates Mixer::fixup_transition_sequences_after_channel_remove without
+    // requiring a GPU — operates on transition_sequences only.
+
+    fn dummy_fade(from: usize, to: usize) -> TransitionStep {
+        use crate::channel::DurationSpec;
+        TransitionStep {
+            kind: StepKind::Fade {
+                from_ch: from,
+                to_ch: to,
+                duration: DurationSpec::Seconds(1.0),
+                easing: CrossfadeEasing::Linear,
+                transition_shader: None,
+                target_amount: 1.0,
+            },
+        }
+    }
+
+    fn dummy_mixer_with_seqs(seqs: Vec<TransitionSequence>) -> Mixer {
+        // Construct only the field we need; everything else is left
+        // unset by routing through a #[cfg(test)] helper would be heavy.
+        // Use a partial init by going through replace fields.
+        let ctx = headless_gpu();
+        let mut m = Mixer::new(&ctx, 16, 16).expect("mixer");
+        *m.transition_sequences_mut() = seqs;
+        m
+    }
+
+    #[test]
+    fn fixup_sequences_shifts_later_channel_indices_down() {
+        let seq = TransitionSequence {
+            name: "S".into(),
+            steps: vec![dummy_fade(0, 3), dummy_fade(2, 4)],
+            enabled: true,
+            state: SequencerState::new(),
+        };
+        let mut m = dummy_mixer_with_seqs(vec![seq]);
+        m.fixup_transition_sequences_after_channel_remove(1);
+        let s = &m.transition_sequences()[0];
+        // (0,3) -> (0,2); (2,4) -> (1,3)
+        if let StepKind::Fade { from_ch, to_ch, .. } = s.steps[0].kind {
+            assert_eq!((from_ch, to_ch), (0, 2));
+        } else { panic!() }
+        if let StepKind::Fade { from_ch, to_ch, .. } = s.steps[1].kind {
+            assert_eq!((from_ch, to_ch), (1, 3));
+        } else { panic!() }
+        assert!(s.enabled);
+    }
+
+    #[test]
+    fn fixup_sequences_disables_when_referencing_removed_channel() {
+        let seq = TransitionSequence {
+            name: "S".into(),
+            steps: vec![dummy_fade(1, 2)],
+            enabled: true,
+            state: SequencerState::new(),
+        };
+        let mut m = dummy_mixer_with_seqs(vec![seq]);
+        m.fixup_transition_sequences_after_channel_remove(1);
+        let s = &m.transition_sequences()[0];
+        assert!(!s.enabled, "sequence referencing removed channel must be disabled");
     }
 
     // ── Mixer-level DnD data model tests ─────────────────────────────

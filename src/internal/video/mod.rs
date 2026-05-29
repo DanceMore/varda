@@ -322,9 +322,13 @@ impl VideoPlayer {
         let was_reverse = self.playback.reverse;
         let result = self.playback.advance_frame();
 
-        // No frames to decode this tick — hold current frame
+        // No frames to decode this tick — hold current GPU texture.
+        // Returning the existing frame data here makes callers re-upload a full
+        // RGBA texture every render frame even when video playback has not
+        // advanced. `None` means “no new frame”; the texture already contains
+        // the frame that should remain visible.
         if result.frames_to_decode == 0 && !result.needs_seek {
-            return Ok(Some(&self.frame_data));
+            return Ok(None);
         }
 
         // Detect ping-pong boundary flips from advance_frame:

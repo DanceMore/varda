@@ -14,7 +14,10 @@ impl Mixer {
     /// Render all channels and composite them via crossfader, then apply master effects.
     pub fn render(&mut self, context: &GpuContext, audio_data: &crate::audio::AudioData, audio_values: &crate::modulation::AudioValues) -> Result<()> {
         let now = std::time::Instant::now();
-        let dt = (now - self.last_render_time).as_secs_f32();
+        // Clamp dt to a sane window: a startup spike or paused window can hand
+        // us multi-second deltas that would blow up frame-rate-dependent
+        // shader math. Floor at 1ms so divisions stay finite.
+        let dt = (now - self.last_render_time).as_secs_f32().clamp(0.001, 0.1);
         self.last_render_time = now;
 
         // Tick auto-crossfade
@@ -84,29 +87,75 @@ impl Mixer {
             channel.tick_video_frames(context);
         }
 
+        // Ensure prev_culled tracks the current channel count (channels may be
+        // added or removed between frames). A newly-added channel starts as
+        // "not culled" so its first cull triggers a clear edge.
+        if self.prev_culled.len() != self.channels.len() {
+            self.prev_culled.resize(self.channels.len(), false);
+        }
+
+        let mut clear_cmds = Vec::new();
         for (ch_idx, channel) in self.channels.iter_mut().enumerate() {
-            if effective_opacities.get(ch_idx).copied().unwrap_or(0.0) < 0.001 {
+            let is_culled = effective_opacities.get(ch_idx).copied().unwrap_or(0.0) < 0.001;
+            let was_culled = self.prev_culled[ch_idx];
+            if is_culled {
                 // Reset stats so culled channels don't show stale render metrics
                 channel.render_time_ms = 0.0;
                 channel.active_deck_count = 0;
+                // One-shot clear on the visible→culled transition only: a
+                // channel that stays culled across frames keeps its already-
+                // black composite_view, and a channel that re-enters visibility
+                // overwrites it on its next render().
+                if !was_culled {
+                    clear_cmds.push(channel.clear_composite_cmd(context));
+                }
+                self.prev_culled[ch_idx] = true;
                 continue;
             }
+            self.prev_culled[ch_idx] = false;
             if let Err(e) = channel.render(context, audio_data, &self.modulation, ch_idx, time, dt) {
                 log::error!("Channel {} render failed, skipping: {}", ch_idx, e);
                 continue;
             }
         }
+        if !clear_cmds.is_empty() {
+            context.queue.submit(clear_cmds);
+        }
 
         self.sync_transition_progress();
-        self.composite_channels(context)?;
-        self.apply_master_effects(context, audio_data, time)?;
+        self.composite_channels(context, dt)?;
+        self.apply_master_effects(context, audio_data, time, dt)?;
 
         self.frame_count += 1;
         Ok(())
     }
 
 
-    fn composite_channels(&mut self, context: &GpuContext) -> Result<()> {
+    /// Per-channel opacity weights for the opacity-based composite passes.
+    ///
+    /// In 2-channel mode this returns the corrected pre-scaled weights for
+    /// the two-pass blit→composite path. Channel B's effective crossfade
+    /// weight is used as the second pass's composite opacity; channel A is
+    /// pre-scaled so that after the second pass attenuates the destination
+    /// by (1 - b), the final result is still the requested linear mix:
+    ///     ((1-cf)·opacityA)·A + (cf·opacityB)·B.
+    /// For >2 channels each channel just contributes its own opacity.
+    fn composite_pass_opacities(&self) -> Vec<f32> {
+        if self.channels.len() == 2 {
+            let b_weight = (self.crossfader * self.channels[1].opacity).clamp(0.0, 1.0);
+            let a_weight = ((1.0 - self.crossfader) * self.channels[0].opacity).clamp(0.0, 1.0);
+            let a_copy_opacity = if b_weight < 1.0 {
+                (a_weight / (1.0 - b_weight)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            vec![a_copy_opacity, b_weight]
+        } else {
+            self.channels.iter().map(|ch| ch.opacity).collect()
+        }
+    }
+
+    fn composite_channels(&mut self, context: &GpuContext, dt: f32) -> Result<()> {
         let channel_count = self.channels.len();
         if channel_count == 0 {
             let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -141,8 +190,8 @@ impl Mixer {
 
                 let uniforms = ISFUniforms {
                     time: self.start_time.elapsed().as_secs_f32(),
-                    time_delta: 1.0 / 60.0,
-                    frame_index: self.frame_count,
+                    time_delta: dt,
+                    frame_index: self.frame_count as u32,
                     pass_index: 0,
                     render_size: [width as f32, height as f32],
                     phase_times: [0.0; 4],
@@ -174,26 +223,40 @@ impl Mixer {
         // RGB output, so if the blit shader also multiplies alpha by opacity, the
         // effective weight becomes opacity² (double-application).
         //
-        // To avoid this, the first channel is always blitted at full opacity and
-        // the crossfader value is used solely as the second channel's composite
-        // opacity.  The composite shader performs `mix(dst, src, src_a)`, which
-        // yields the correct linear crossfade: (1-cf)·A + cf·B.
-        let opacities: Vec<f32> = if channel_count == 2 {
-            vec![1.0, self.crossfader]
-        } else {
-            self.channels.iter().map(|ch| ch.opacity).collect()
-        };
+        // To avoid this, channel B's effective crossfade weight is used as the
+        // second channel's composite opacity. Channel A is pre-scaled so that,
+        // after the second pass attenuates the destination by (1 - b), the final
+        // result is still the requested linear mix:
+        //     ((1-cf)·opacityA)·A + (cf·opacityB)·B.
+        let opacities: Vec<f32> = self.composite_pass_opacities();
+
+        // Make sure the per-channel bind-group caches track the current
+        // channel count. resize() / channel mutations clear these, but a
+        // length mismatch can also occur if a future caller forgets — fix
+        // it lazily here.
+        if self.channel_blit_bg_cache.len() != self.channels.len() {
+            self.channel_blit_bg_cache.resize_with(self.channels.len(), || None);
+        }
+        if self.channel_composite_bg_cache.len() != self.channels.len() {
+            self.channel_composite_bg_cache.resize_with(self.channels.len(), || None);
+        }
 
         // Submit per-channel to ensure each channel's uniform buffer writes
         // are consumed before the next channel overwrites them.
         let mut is_first = true;
-        for (_i, (channel, &opacity)) in self.channels.iter().zip(opacities.iter()).enumerate() {
+        for i in 0..self.channels.len() {
+            let opacity = opacities[i];
             if opacity <= 0.0 { continue; }
 
             if is_first {
                 // First visible channel: simple blit copy
                 self.blit_pipeline.set_opacity(&context.queue, opacity);
-                let bind_group = self.blit_pipeline.create_bind_group(&context.device, &channel.composite_view);
+                if self.channel_blit_bg_cache[i].is_none() {
+                    self.channel_blit_bg_cache[i] = Some(
+                        self.blit_pipeline.create_bind_group(&context.device, &self.channels[i].composite_view),
+                    );
+                }
+                let bind_group = self.channel_blit_bg_cache[i].as_ref().unwrap();
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Mixer Composite Encoder (first)"),
                 });
@@ -213,7 +276,7 @@ impl Mixer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.blit_pipeline.render(&mut render_pass, &bind_group);
+                    self.blit_pipeline.render(&mut render_pass, bind_group);
                 }
                 context.queue.submit(std::iter::once(encoder.finish()));
                 is_first = false;
@@ -228,9 +291,18 @@ impl Mixer {
                     self.composite_texture.size(),
                 );
 
-                let blend_mode = channel.blend_mode;
+                let blend_mode = self.channels[i].blend_mode;
                 self.composite_pipeline.set_params(&context.queue, opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
-                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &channel.composite_view, &self.effect_ping_view);
+                if self.channel_composite_bg_cache[i].is_none() {
+                    self.channel_composite_bg_cache[i] = Some(
+                        self.composite_pipeline.create_bind_group(
+                            &context.device,
+                            &self.channels[i].composite_view,
+                            &self.effect_ping_view,
+                        ),
+                    );
+                }
+                let bind_group = self.channel_composite_bg_cache[i].as_ref().unwrap();
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Mixer Composite Encoder"),
                 });
@@ -250,7 +322,7 @@ impl Mixer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.composite_pipeline.render(&mut render_pass, &bind_group);
+                    self.composite_pipeline.render(&mut render_pass, bind_group);
                 }
                 context.queue.submit([copy_encoder.finish(), encoder.finish()]);
             }
@@ -285,13 +357,9 @@ impl Mixer {
             None => return,
         };
 
-        let channel_count = self.channels.len();
-        // Same linear-crossfade formula as composite_channels (see comment there).
-        let opacities: Vec<f32> = if channel_count == 2 {
-            vec![1.0, self.crossfader]
-        } else {
-            self.channels.iter().map(|ch| ch.opacity).collect()
-        };
+        // Same linear-crossfade formula as composite_channels — share the helper
+        // so sub-mixes get the corrected opacity-compensation math.
+        let opacities: Vec<f32> = self.composite_pass_opacities();
 
         // Submit per-channel to ensure each channel's uniform buffer writes
         // are consumed before the next channel overwrites them.
@@ -399,7 +467,7 @@ impl Mixer {
     }
 
 
-    fn apply_master_effects(&mut self, context: &GpuContext, audio_data: &crate::audio::AudioData, time: f32) -> Result<()> {
+    fn apply_master_effects(&mut self, context: &GpuContext, audio_data: &crate::audio::AudioData, time: f32, dt: f32) -> Result<()> {
         if self.master_effects.is_empty() {
             return Ok(());
         }
@@ -409,8 +477,8 @@ impl Mixer {
 
         let uniforms = ISFUniforms {
             time,
-            time_delta: 1.0 / 60.0,
-            frame_index: self.frame_count,
+            time_delta: dt,
+            frame_index: self.frame_count as u32,
             pass_index: 0,
             render_size: [width as f32, height as f32],
             audio_level: audio_data.level,

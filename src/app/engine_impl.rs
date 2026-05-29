@@ -26,11 +26,19 @@ impl MixerCommands for VardaApp {
 
     fn start_auto_crossfade(&mut self, target: f32, duration_secs: f32, easing: CrossfadeEasing) {
         let target = sanitize_unit(target, 0.5);
+        if !duration_secs.is_finite() || duration_secs <= 0.0 {
+            self.mixer.snap_crossfader(target);
+            return;
+        }
         self.mixer.start_crossfade(target, duration_secs, easing);
     }
 
     fn start_beat_crossfade(&mut self, target: f32, beats: f32) {
         let target = sanitize_unit(target, 0.5);
+        if !beats.is_finite() || beats <= 0.0 {
+            self.mixer.snap_crossfader(target);
+            return;
+        }
         self.mixer.start_beat_crossfade(target, beats);
     }
 
@@ -216,6 +224,15 @@ impl MixerCommands for VardaApp {
     }
 
     fn remove_channel(&mut self, channel_idx: usize) -> Result<()> {
+        // Guard before touching managers so we don't release resources for a
+        // channel that won't actually be removed (minimum-2 enforcement).
+        if self.mixer.channels().len() <= 2 || channel_idx >= self.mixer.channels().len() {
+            anyhow::bail!("Cannot remove channel (minimum 2 required)")
+        }
+        // Release external resources (camera / NDI / SRT / Syphon) held by
+        // decks in the channel BEFORE mixer.remove_channel drops them, so
+        // long-lived installs don't leak hardware/socket handles.
+        self.release_channel_external_resources(channel_idx);
         if self.mixer.remove_channel(channel_idx) {
             // Selection fixup is handled by the UI consumer (UIRunner)
             Ok(())

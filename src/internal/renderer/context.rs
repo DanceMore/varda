@@ -1182,7 +1182,12 @@ impl HeadlessOutput {
         width: u32,
         height: u32,
     ) -> Self {
-        let format = wgpu::TextureFormat::Rgba8Unorm;
+        // Match the mixer composite's sRGB gamma so recorded/streamed/NDI
+        // output looks the same as the windowed display. The previous
+        // Rgba8Unorm target stored linear-encoded bytes from an Srgb source;
+        // ffmpeg/NDI then interpreted those linear bytes as sRGB and the
+        // recording came out washed out vs the on-screen view.
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Headless Output Texture"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },

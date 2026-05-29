@@ -358,7 +358,7 @@ impl UnifiedPipeline {
         pass_buffer_views: &[&wgpu::TextureView],
         imported_views: &[&wgpu::TextureView],
         user_params_buffer: Option<&wgpu::Buffer>,
-    ) -> wgpu::BindGroup {
+    ) -> Option<wgpu::BindGroup> {
         let mut entries = vec![];
         let mut next_binding: u32 = 0;
 
@@ -380,7 +380,10 @@ impl UnifiedPipeline {
 
         // Input image (for filters)
         if self.has_input_image {
-            let view = input_view.expect("Filter pipeline requires an input texture view");
+            let Some(view) = input_view else {
+                log::warn!("Filter pipeline expected an input texture view but received None; skipping bind group");
+                return None;
+            };
             entries.push(wgpu::BindGroupEntry {
                 binding: next_binding,
                 resource: wgpu::BindingResource::TextureView(view),
@@ -413,11 +416,11 @@ impl UnifiedPipeline {
             resource: params_buf.as_entire_binding(),
         });
 
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
+        Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ISF Unified Bind Group"),
             layout: &self.bind_group_layout,
             entries: &entries,
-        })
+        }))
     }
 
     /// Convenience: create bind group for simple generator (no input, no passes, no imports)
@@ -425,7 +428,7 @@ impl UnifiedPipeline {
         &self,
         device: &wgpu::Device,
         user_params_buffer: &wgpu::Buffer,
-    ) -> wgpu::BindGroup {
+    ) -> Option<wgpu::BindGroup> {
         self.create_bind_group(device, None, &[], &[], Some(user_params_buffer))
     }
 

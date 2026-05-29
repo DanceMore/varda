@@ -109,7 +109,7 @@ impl FfmpegSubprocess {
         write_failed: Arc<AtomicBool>,
         shutting_down: Arc<AtomicBool>,
         label: String,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> anyhow::Result<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
             .name(format!("ffmpeg-writer-{}", label))
             .spawn(move || {
@@ -128,7 +128,7 @@ impl FfmpegSubprocess {
                 // Channel closed — normal shutdown, flush stdin
                 let _ = stdin.flush();
             })
-            .expect("failed to spawn ffmpeg writer thread")
+            .map_err(|e| anyhow::anyhow!("failed to spawn ffmpeg writer thread: {}", e))
     }
 
     /// Spawn an ffmpeg recording subprocess.
@@ -177,7 +177,7 @@ impl FfmpegSubprocess {
         let (tx, rx) = mpsc::sync_channel(FRAME_CHANNEL_CAPACITY);
         let writer_thread = Self::start_writer_thread(
             stdin, rx, frames_written.clone(), write_failed.clone(), shutting_down.clone(), path.to_string(),
-        );
+        )?;
 
         Ok(Self {
             child,
@@ -244,7 +244,7 @@ impl FfmpegSubprocess {
         let (tx, rx) = mpsc::sync_channel(FRAME_CHANNEL_CAPACITY);
         let writer_thread = Self::start_writer_thread(
             stdin, rx, frames_written.clone(), write_failed.clone(), shutting_down.clone(), url.to_string(),
-        );
+        )?;
 
         Ok(Self {
             child,
@@ -325,7 +325,7 @@ impl FfmpegSubprocess {
         let (tx, rx) = mpsc::sync_channel(FRAME_CHANNEL_CAPACITY);
         let writer_thread = Self::start_writer_thread(
             stdin, rx, frames_written.clone(), write_failed.clone(), shutting_down.clone(), name.to_string(),
-        );
+        )?;
 
         Ok(Self {
             child,
@@ -390,7 +390,7 @@ impl FfmpegSubprocess {
         let label = url.to_string();
         let writer_thread = Self::start_writer_thread(
             stdin, rx, frames_written.clone(), write_failed.clone(), shutting_down.clone(), label.clone(),
-        );
+        )?;
 
         Ok(Self {
             child,
@@ -457,7 +457,7 @@ impl FfmpegSubprocess {
         let (tx, rx) = mpsc::sync_channel(FRAME_CHANNEL_CAPACITY);
         let writer_thread = Self::start_writer_thread(
             stdin, rx, frames_written.clone(), write_failed.clone(), shutting_down.clone(), name.to_string(),
-        );
+        )?;
 
         Ok(Self {
             child,

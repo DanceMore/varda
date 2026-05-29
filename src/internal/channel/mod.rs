@@ -355,7 +355,7 @@ pub struct Channel {
     pub effect_ping_view: wgpu::TextureView,
 
     /// Frame counter for uniforms
-    frame_count: u32,
+    frame_count: u64,
 
     /// Shader-based composite pipeline for blending decks (all blend modes via uniform)
     composite_pipeline: CompositeBlitPipeline,
@@ -462,6 +462,33 @@ impl Channel {
         }
     }
 
+    /// Clear the channel composite texture when the channel is culled from the
+    /// mixer. This prevents stale content from a previous visible frame being
+    /// sampled by crossfade or transition paths that still read channel views.
+    pub fn clear_composite_cmd(&self, context: &GpuContext) -> wgpu::CommandBuffer {
+        let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Channel Culled Clear Encoder"),
+        });
+        {
+            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Channel Culled Clear Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.composite_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        encoder.finish()
+    }
+
     /// Render all decks in this channel and composite them, then apply channel effects
     /// `channel_idx` is used for modulation key addressing (e.g., "ch0_deck0:paramname")
     /// `dt` is the frame delta in seconds (for auto-transition tick).
@@ -498,7 +525,13 @@ impl Channel {
         for (_deck_idx, slot) in self.decks.iter_mut().enumerate() {
             if !slot.mute && (!any_solo || slot.solo) && slot.opacity > 0.0 {
                 active_count += 1;
-                let param_prefix = format!("deck_{}", slot.deck.uuid());
+                // Use the cached "deck_{uuid}" prefix to avoid a per-frame
+                // format!() allocation on the channel render hot path.
+                // Clone is unavoidable here because render_with_prefix borrows
+                // self.deck mutably; the alternative is plumbing a separate
+                // borrow path. The clone is one short String (≈11 bytes) and
+                // happens once per visible deck per frame.
+                let param_prefix = slot.deck.mod_prefix.clone();
                 slot.deck.render_with_prefix(context, audio_data, modulation, &param_prefix, &mut cmd_buffers)?;
             }
         }
@@ -588,7 +621,7 @@ impl Channel {
                     let uniforms = ISFUniforms {
                         time,
                         time_delta: dt,
-                        frame_index: self.frame_count,
+                        frame_index: self.frame_count as u32,
                         pass_index: 0,
                         render_size: [width as f32, height as f32],
                         phase_times: [0.0; 4],
@@ -778,8 +811,8 @@ impl Channel {
 
             let uniforms = ISFUniforms {
                 time,
-                time_delta: 1.0 / 60.0,
-                frame_index: self.frame_count,
+                time_delta: dt,
+                frame_index: self.frame_count as u32,
                 pass_index: 0,
                 render_size: [width as f32, height as f32],
                 audio_level: audio_data.level,
@@ -806,7 +839,10 @@ impl Channel {
                     (&self.effect_ping_view, &self.composite_view)
                 };
 
-                let fx_prefix = format!("fx_{}", effect.uuid);
+                // Use the cached "fx_{uuid}" prefix to avoid per-frame
+                // allocation. Clone needed because effect is borrowed mutably
+                // below via apply_with_modulation.
+                let fx_prefix = effect.mod_prefix.clone();
                 if let Err(e) = effect.apply_with_modulation(context, input_view, output_view, &uniforms, Some(modulation), Some(&fx_prefix), &mut fx_cmd_buffers) {
                     log::warn!("Effect {} failed, skipping: {}", _eff_idx, e);
                     continue;
@@ -852,11 +888,32 @@ impl Channel {
         for slot in &mut self.decks {
             slot.deck.resize(context, width, height);
         }
+        for effect in self.effects.iter_mut() {
+            effect.resize(context, width, height);
+        }
     }
 
     /// Add a channel effect
     pub fn add_effect(&mut self, effect: Effect) {
         self.effects.push(effect);
+    }
+
+    /// Collect deck and effect UUIDs owned by this channel for modulation-assignment cleanup.
+    /// Returns (deck_uuids, effect_uuids) where effect_uuids covers both deck-effects and
+    /// channel-effects (master effects are owned by the Mixer, not the Channel).
+    pub fn collect_modulation_uuids(&self) -> (Vec<String>, Vec<String>) {
+        let mut deck_uuids = Vec::with_capacity(self.decks.len());
+        let mut effect_uuids = Vec::new();
+        for slot in &self.decks {
+            deck_uuids.push(slot.deck.uuid().to_string());
+            for eff in &slot.deck.effects {
+                effect_uuids.push(eff.uuid.clone());
+            }
+        }
+        for eff in &self.effects {
+            effect_uuids.push(eff.uuid.clone());
+        }
+        (deck_uuids, effect_uuids)
     }
 
     /// Remove a channel effect by index

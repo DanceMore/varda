@@ -125,6 +125,10 @@ impl VardaApp {
         let now = std::time::Instant::now();
         let dt = now.duration_since(self.frame_stats.last_frame_instant).as_secs_f32();
         self.frame_stats.last_frame_instant = now;
+        // Tick the host-side frame counter exposed via EngineState to remote
+        // API/WebSocket consumers. Was initialized to 0 and never advanced,
+        // so external dashboards saw a permanent 0.
+        self.frame_stats.frame_count = self.frame_stats.frame_count.wrapping_add(1);
         if dt > 0.0 {
             let instant_fps = 1.0 / dt;
             self.frame_stats.fps_history.push_back(instant_fps);

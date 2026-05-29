@@ -238,12 +238,18 @@ impl ClockManager {
 
     /// Process an OSC /clock/bpm message.
     pub fn process_osc_bpm(&mut self, bpm: f32) {
+        if !bpm.is_finite() || bpm <= 0.0 {
+            return;
+        }
         self.osc_bpm = Some(bpm);
         self.osc_last_message = Some(Instant::now());
     }
 
     /// Process an OSC /clock/beat message (beat phase 0.0–1.0).
     pub fn process_osc_beat(&mut self, phase: f32) {
+        if !phase.is_finite() {
+            return;
+        }
         self.osc_beat_phase = Some(phase.clamp(0.0, 1.0));
         self.osc_last_message = Some(Instant::now());
     }
@@ -252,8 +258,8 @@ impl ClockManager {
 
     /// Update audio-detected BPM and beat phase (called each frame).
     pub fn update_audio(&mut self, bpm: Option<f32>, beat_phase: f32) {
-        self.audio_bpm = bpm;
-        self.audio_beat_phase = beat_phase;
+        self.audio_bpm = bpm.filter(|b| b.is_finite() && *b > 0.0);
+        self.audio_beat_phase = if beat_phase.is_finite() { beat_phase } else { 0.0 };
     }
 
     // ── Detected sources ────────────────────────────────────────

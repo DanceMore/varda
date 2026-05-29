@@ -299,8 +299,23 @@ impl VardaApp {
                 self.context.texture_format, &mut warnings);
         }
 
-        // Remove excess channels
+        // Remove excess channels — release external resources and purge
+        // modulation assignments for each dropped channel before truncate,
+        // otherwise long-lived scene-swap loops leak cameras / NDI / SRT.
         if current_ch_count > target_ch_count {
+            for ch_idx in target_ch_count..current_ch_count {
+                self.release_channel_external_resources(ch_idx);
+                let (deck_uuids, effect_uuids) = self.mixer.channels()[ch_idx]
+                    .collect_modulation_uuids();
+                for u in &deck_uuids {
+                    self.mixer.modulation_mut()
+                        .remove_assignments_with_prefix(&format!("deck_{}:", u));
+                }
+                for u in &effect_uuids {
+                    self.mixer.modulation_mut()
+                        .remove_assignments_with_prefix(&format!("fx_{}:", u));
+                }
+            }
             self.mixer.channels_mut().truncate(target_ch_count);
             structural = true;
         }

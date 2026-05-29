@@ -43,6 +43,12 @@ impl ScalingMode {
         source_w: u32, source_h: u32,
         target_w: u32, target_h: u32,
     ) -> ([f32; 2], [f32; 2]) {
+        // External sources (NDI/SRT/camera) report 0×0 dimensions before
+        // their first frame lands. Treat any zero dimension as 1×1 so we
+        // hand back identity UVs instead of Inf/NaN through the GPU uniforms.
+        if source_w == 0 || source_h == 0 || target_w == 0 || target_h == 0 {
+            return ([1.0, 1.0], [0.0, 0.0]);
+        }
         let src_aspect = source_w as f32 / source_h as f32;
         let tgt_aspect = target_w as f32 / target_h as f32;
 
@@ -177,6 +183,8 @@ impl ExternalSourceKind {
 pub struct Effect {
     /// Stable UUID for this effect (8-char hex)
     pub uuid: String,
+    /// Cached "fx_{uuid}" modulation prefix; reused every frame.
+    pub mod_prefix: String,
     pub shader: ISFShader,
     pub pipeline: UnifiedPipeline,
     pub enabled: bool,
@@ -187,9 +195,15 @@ pub struct Effect {
     /// GPU textures loaded from ISF IMPORTED images (sorted by name for deterministic binding)
     pub imported_textures: Vec<(String, wgpu::Texture, wgpu::TextureView)>,
     /// Phase accumulators for smooth speed transitions
-    pub phase_accumulators: [f32; 4],
+    pub phase_accumulators: [f64; 4],
     /// Phase input config from shader metadata
     pub phase_inputs_config: Option<Vec<crate::isf::PhaseInput>>,
+    /// 1×1 black texture substituted for a non-persistent pass buffer when
+    /// the current render target would otherwise be bound as a sampled input
+    /// in the same pass (wgpu validation error). Created once at effect
+    /// construction.
+    pub placeholder_texture: wgpu::Texture,
+    pub placeholder_view: wgpu::TextureView,
 }
 
 // Effect impl is in effect.rs
@@ -217,6 +231,11 @@ pub struct PassBuffer {
 pub struct Deck {
     /// Stable UUID for this deck (8-char hex, persists across moves/saves)
     uuid: String,
+
+    /// Cached "deck_{uuid}" modulation prefix. Built once at construction and
+    /// reused every frame to avoid per-frame format!() allocations in the
+    /// channel/deck render path.
+    pub mod_prefix: String,
 
     /// Name of this deck's source
     source_name: String,
@@ -251,7 +270,7 @@ pub struct Deck {
     start_time: Instant,
 
     /// Frame counter
-    frame_count: u32,
+    frame_count: u64,
 
     /// Last frame time
     last_frame_time: Instant,
@@ -263,7 +282,7 @@ pub struct Deck {
     fps_smoothed: f32,
 
     /// Phase accumulators for smooth speed transitions (generator shader)
-    phase_accumulators: [f32; 4],
+    phase_accumulators: [f64; 4],
 
     /// Phase input config from generator shader metadata
     generator_phase_inputs: Option<Vec<crate::isf::PhaseInput>>,
@@ -279,6 +298,7 @@ impl Deck {
 
     /// Set the UUID (used during scene restore to preserve identity)
     pub fn set_uuid(&mut self, uuid: String) {
+        self.mod_prefix = format!("deck_{}", uuid);
         self.uuid = uuid;
     }
 

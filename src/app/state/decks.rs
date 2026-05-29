@@ -5,6 +5,30 @@ use crate::usecases::ui::UIActions;
 use super::super::VardaApp;
 
 impl VardaApp {
+    /// Release external resources (camera / NDI / SRT / Syphon) held by every
+    /// deck in a channel. Used by channel-removal and apply_scene_diff truncate
+    /// paths so long-lived installs don't leak hardware/socket handles.
+    pub(crate) fn release_channel_external_resources(&mut self, channel_idx: usize) {
+        let Some(ch) = self.mixer.channels().get(channel_idx) else { return; };
+        let mut cams = Vec::new();
+        let mut srt = Vec::new();
+        let mut ndi = Vec::new();
+        #[cfg(target_os = "macos")]
+        let mut syphon = Vec::new();
+        for slot in &ch.decks {
+            if let Some(id) = slot.deck.camera_id() { cams.push(id); }
+            if let Some(idx) = slot.deck.srt_receiver_idx() { srt.push(idx); }
+            if let Some(idx) = slot.deck.ndi_receiver_idx() { ndi.push(idx); }
+            #[cfg(target_os = "macos")]
+            if let Some(idx) = slot.deck.syphon_client_idx() { syphon.push(idx); }
+        }
+        for id in cams { self.camera_manager.release_camera(id); }
+        for idx in srt { self.external_io.stream_manager.stop_receive(idx); }
+        for idx in ndi { self.external_io.ndi_manager.stop_receive(idx); }
+        #[cfg(target_os = "macos")]
+        for idx in syphon { self.external_io.syphon_manager.stop_receive(idx); }
+    }
+
     /// Apply deck add/remove and effect add/remove/toggle actions.
     /// `egui_renderer` and `deck_preview_textures` are passed in because they
     /// are egui-specific state owned by the window layer.

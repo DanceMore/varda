@@ -108,8 +108,16 @@ impl ReadbackBuffer {
     /// Try to read the previous frame's data. Returns RGBA bytes (tightly packed, no padding)
     /// or None if no previous frame is available yet.
     ///
-    /// This maps the buffer synchronously with `poll(Wait)`. For the output thread
-    /// this is acceptable since we're 1 frame behind.
+    /// Non-blocking: drives wgpu's work queue with a single Poll and returns
+    /// immediately if the previous frame's map_async callback has not yet
+    /// landed. The previous implementation spun in a loop polling
+    /// `is_queue_empty()` — but `begin_readback` is called on the same frame
+    /// before `try_read`, so the just-queued copy means the queue is never
+    /// empty and the loop blocked until that copy completed (up to 16ms),
+    /// turning double-buffering into synchronous readback and stalling
+    /// the render thread for every active headless output. The mapping for
+    /// the OPPOSITE buffer (written one frame earlier) is normally already
+    /// ready, so one Poll + try_recv is enough in steady state.
     pub fn try_read(&mut self, device: &wgpu::Device) -> Option<Vec<u8>> {
         if !self.has_previous {
             return None;
@@ -133,28 +141,17 @@ impl ReadbackBuffer {
         // Mark mapped so we can clean up on timeout or next call
         self.mapped[read_idx] = true;
 
-        let poll_start = std::time::Instant::now();
-        loop {
-            match device.poll(wgpu::PollType::Poll) {
-                Ok(status) if status.is_queue_empty() => break,
-                Err(e) => {
-                    log::warn!("GPU poll error during readback: {}", e);
-                    // Buffer may or may not have completed mapping; leave mapped flag
-                    // set so begin_readback or next try_read will unmap defensively.
-                    return None;
-                }
-                _ => {}
-            }
-            if poll_start.elapsed() > std::time::Duration::from_millis(16) {
-                log::warn!("GPU readback timeout, skipping frame");
-                // map_async callback may fire later; mapped flag stays true
-                // so begin_readback will unmap before reusing this buffer.
-                return None;
-            }
-            std::thread::yield_now();
+        // Drive wgpu's work queue once. We do NOT wait for the queue to
+        // drain — the current frame's just-submitted copy doesn't need to
+        // finish for the previous frame's map_async to complete.
+        if let Err(e) = device.poll(wgpu::PollType::Poll) {
+            log::warn!("GPU poll error during readback: {}", e);
+            // Buffer may or may not have completed mapping; leave mapped flag
+            // set so begin_readback or next try_read will unmap defensively.
+            return None;
         }
 
-        match rx.recv() {
+        match rx.try_recv() {
             Ok(Ok(())) => {
                 let data = slice.get_mapped_range();
                 let unpadded_bytes_per_row = (self.width * 4) as usize;
@@ -178,8 +175,18 @@ impl ReadbackBuffer {
                 self.mapped[read_idx] = false;
                 Some(result)
             }
-            _ => {
-                // Map failed — unmap defensively
+            Ok(Err(e)) => {
+                log::warn!("Readback map failed: {:?}", e);
+                buffer.unmap();
+                self.mapped[read_idx] = false;
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Callback hasn't fired yet — leave mapped flag set so the
+                // next begin_readback unmaps defensively before reuse.
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 buffer.unmap();
                 self.mapped[read_idx] = false;
                 None

@@ -266,8 +266,11 @@ impl Deck {
             _ => None,
         };
 
+        let uuid = super::generate_short_uuid();
+        let mod_prefix = format!("deck_{}", uuid);
         Ok(Self {
-            uuid: super::generate_short_uuid(),
+            uuid,
+            mod_prefix,
             source_name,
             source_path,
             source,
@@ -283,7 +286,7 @@ impl Deck {
             last_frame_time: now,
             external_source_view: None,
             fps_smoothed: 0.0,
-            phase_accumulators: [0.0; 4],
+            phase_accumulators: [0.0f64; 4],
             generator_phase_inputs,
         })
     }
@@ -592,8 +595,11 @@ impl Deck {
         let now = Instant::now();
         let generator_params = ShaderParams::from_inputs(&[]);
 
+        let uuid = super::generate_short_uuid();
+        let mod_prefix = format!("deck_{}", uuid);
         Ok(Self {
-            uuid: super::generate_short_uuid(),
+            uuid,
+            mod_prefix,
             source_name,
             source_path,
             source,
@@ -609,7 +615,7 @@ impl Deck {
             last_frame_time: now,
             external_source_view: None,
             fps_smoothed: 0.0,
-            phase_accumulators: [0.0; 4],
+            phase_accumulators: [0.0f64; 4],
             generator_phase_inputs: None,
         })
     }

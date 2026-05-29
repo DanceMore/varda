@@ -110,8 +110,41 @@ impl Effect {
         let params = ShaderParams::from_inputs(inputs);
         let phase_inputs_config = shader.metadata.phase_inputs.clone();
 
+        // 1×1 black placeholder used in place of a non-persistent pass buffer
+        // whose texture is currently bound as the render target — avoids
+        // sampling a render attachment in the same pass.
+        let placeholder_texture = context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Effect Pass Placeholder"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        context.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &placeholder_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8, 0, 0, 0],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let placeholder_view = placeholder_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let uuid = crate::deck::generate_short_uuid();
+        let mod_prefix = format!("fx_{}", uuid);
         Ok(Self {
-            uuid: crate::deck::generate_short_uuid(),
+            uuid,
+            mod_prefix,
             shader,
             pipeline,
             enabled: true,
@@ -120,8 +153,10 @@ impl Effect {
             passes,
             target_format,
             imported_textures,
-            phase_accumulators: [0.0; 4],
+            phase_accumulators: [0.0f64; 4],
             phase_inputs_config,
+            placeholder_texture,
+            placeholder_view,
         })
     }
 
@@ -192,19 +227,33 @@ impl Effect {
                     pass_uniforms.pass_index = pass_idx as i32;
                     self.pipeline.update_uniforms(&context.queue, &pass_uniforms);
 
+                    // Bind every targeted pass's read_view in declaration order.
+                    // A non-persistent buffer whose target equals THIS pass's
+                    // target would otherwise be sampled while it's also the
+                    // render attachment — substitute the 1×1 placeholder for
+                    // that slot to keep bind-group slot indices stable while
+                    // avoiding the wgpu read/write self-binding error.
                     let pass_buffer_views: Vec<&wgpu::TextureView> = self.passes
                         .iter()
                         .filter_map(|p| p.target.as_ref().and_then(|t| self.pass_buffers.get(t)))
-                        .map(|pb| pb.read_view())
+                        .map(|pb| {
+                            if !pb.persistent && pb.name == target_name {
+                                &self.placeholder_view
+                            } else {
+                                pb.read_view()
+                            }
+                        })
                         .collect();
 
-                    let bind_group = self.pipeline.create_bind_group(
+                    let Some(bind_group) = self.pipeline.create_bind_group(
                         &context.device,
                         Some(input_view),
                         &pass_buffer_views,
                         &imported_views,
                         Some(user_params_buffer),
-                    );
+                    ) else {
+                        continue;
+                    };
 
                     let target_view = self.pass_buffers.get(&target_name)
                         .map(|pb| pb.write_view())
@@ -258,13 +307,15 @@ impl Effect {
                 .map(|pb| pb.read_view())
                 .collect();
 
-            let bind_group = self.pipeline.create_bind_group(
+            let Some(bind_group) = self.pipeline.create_bind_group(
                 &context.device,
                 Some(input_view),
                 &pass_buffer_views,
                 &imported_views,
                 Some(user_params_buffer),
-            );
+            ) else {
+                return Ok(());
+            };
 
             let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Effect Final Pass Encoder"),
@@ -297,13 +348,15 @@ impl Effect {
             // Simple single-pass effect
             self.pipeline.update_uniforms(&context.queue, uniforms);
 
-            let bind_group = self.pipeline.create_bind_group(
+            let Some(bind_group) = self.pipeline.create_bind_group(
                 &context.device,
                 Some(input_view),
                 &[],
                 &imported_views,
                 Some(user_params_buffer),
-            );
+            ) else {
+                return Ok(());
+            };
 
             let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Effect Render Encoder"),
@@ -335,6 +388,80 @@ impl Effect {
         }
 
         Ok(())
+    }
+}
+
+impl Effect {
+    /// Recreate the multi-pass pass buffers at the given render dimensions.
+    /// Effect::new historically hardcoded 1920×1080 for the base; callers
+    /// should invoke this whenever their owning Deck/Channel/Mixer resizes
+    /// so RENDERSIZE in ISF shaders matches the actual render resolution
+    /// and lower-res renders don't waste memory on oversized pass buffers.
+    ///
+    /// Pass `width`-expressions in ISF (e.g. `$WIDTH/2`) are re-evaluated
+    /// against the new base dimensions.
+    pub fn resize(&mut self, context: &GpuContext, width: u32, height: u32) {
+        let width = width.max(1);
+        let height = height.max(1);
+        for pass in &self.passes {
+            let target_name = match &pass.target {
+                Some(name) => name.clone(),
+                None => continue,
+            };
+
+            let pass_width = Deck::parse_size_expression(&pass.width, width);
+            let pass_height = Deck::parse_size_expression(&pass.height, height);
+            let is_persistent = pass.persistent.unwrap_or(false);
+
+            let format = if pass.float.unwrap_or(false) {
+                wgpu::TextureFormat::Rgba32Float
+            } else {
+                wgpu::TextureFormat::Rgba8Unorm
+            };
+
+            let tex_a = context.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("Effect Pass Buffer A: {}", target_name)),
+                size: wgpu::Extent3d { width: pass_width, height: pass_height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                     | wgpu::TextureUsages::TEXTURE_BINDING
+                     | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view_a = tex_a.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let (tex_b, view_b) = if is_persistent {
+                let tex = context.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&format!("Effect Pass Buffer B: {}", target_name)),
+                    size: wgpu::Extent3d { width: pass_width, height: pass_height, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                         | wgpu::TextureUsages::TEXTURE_BINDING
+                         | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+                (Some(tex), Some(view))
+            } else {
+                (None, None)
+            };
+
+            self.pass_buffers.insert(target_name.clone(), PassBuffer {
+                name: target_name,
+                texture_a: tex_a,
+                view_a,
+                texture_b: tex_b,
+                view_b,
+                persistent: is_persistent,
+                read_idx: 0,
+            });
+        }
     }
 }
 
