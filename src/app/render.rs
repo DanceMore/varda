@@ -372,7 +372,7 @@ impl VardaApp {
         match source {
             OutputSource::Master => Some(mixer.composite_view()),
             OutputSource::Channel(ch_idx) => {
-                mixer.channels().get(*ch_idx).map(|ch| &ch.composite_view)
+                mixer.channels().get(*ch_idx).map(|ch| ch.composite_view())
             }
             OutputSource::Channels(indices) => {
                 let mut sorted = indices.clone();

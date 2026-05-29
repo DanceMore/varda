@@ -410,7 +410,7 @@ impl UIRunner {
             }
             // Channel composite preview
             let ch_tid = egui_renderer.register_native_texture(
-                &context.device, &ch.composite_view, wgpu::FilterMode::Linear,
+                &context.device, ch.composite_view(), wgpu::FilterMode::Linear,
             );
             self.channel_preview_textures.insert(ch_idx, ch_tid);
         }
@@ -456,7 +456,7 @@ impl UIRunner {
             UnifiedOutput::Headless(h) => match &h.source {
                 OutputSource::Master => mixer.composite_view(),
                 OutputSource::Channel(idx) => mixer.channels().get(*idx)
-                    .map(|c| &c.composite_view)
+                    .map(|c| c.composite_view())
                     .unwrap_or_else(|| mixer.composite_view()),
                 OutputSource::Deck(ch, dk) => mixer.channels().get(*ch)
                     .and_then(|c| c.decks.get(*dk))
@@ -502,7 +502,7 @@ impl UIRunner {
             }
             if !self.channel_preview_textures.contains_key(&ch_idx) {
                 let tid = egui_renderer.register_native_texture(
-                    &context.device, &ch.composite_view, wgpu::FilterMode::Linear,
+                    &context.device, ch.composite_view(), wgpu::FilterMode::Linear,
                 );
                 self.channel_preview_textures.insert(ch_idx, tid);
             }
@@ -925,7 +925,7 @@ impl UIRunner {
                                 self.deck_preview_textures.insert((ch_idx, deck_idx), tex_id);
                             }
                             let ch_tid = egui_renderer.register_native_texture(
-                                &context.device, &ch.composite_view,
+                                &context.device, ch.composite_view(),
                                 wgpu::FilterMode::Linear,
                             );
                             self.channel_preview_textures.insert(ch_idx, ch_tid);
@@ -976,7 +976,7 @@ impl UIRunner {
                     }
                     if let Some(&ch_tid) = self.channel_preview_textures.get(&ch_idx) {
                         egui_renderer.update_egui_texture_from_wgpu_texture(
-                            &context.device, &ch.composite_view,
+                            &context.device, ch.composite_view(),
                             wgpu::FilterMode::Linear, ch_tid,
                         );
                     }

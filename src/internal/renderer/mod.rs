@@ -10,6 +10,7 @@ pub mod readback;
 pub mod subprocess;
 pub mod transition;
 pub mod warp;
+pub mod ping_pong;
 
 pub use context::*;
 pub use dome::*;
@@ -23,4 +24,5 @@ pub use readback::*;
 pub use subprocess::*;
 pub use transition::*;
 pub use warp::*;
+pub use ping_pong::*;
 

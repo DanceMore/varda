@@ -205,8 +205,8 @@ impl Mixer {
 
                 transition.pipeline.render_to(
                     context,
-                    &self.channels[0].composite_view,
-                    &self.channels[1].composite_view,
+                    self.channels[0].composite_view(),
+                    self.channels[1].composite_view(),
                     &self.composite_view,
                     &uniforms,
                     transition.params.buffer(),
@@ -253,7 +253,7 @@ impl Mixer {
                 self.blit_pipeline.set_opacity(&context.queue, opacity);
                 if self.channel_blit_bg_cache[i].is_none() {
                     self.channel_blit_bg_cache[i] = Some(
-                        self.blit_pipeline.create_bind_group(&context.device, &self.channels[i].composite_view),
+                        self.blit_pipeline.create_bind_group(&context.device, self.channels[i].composite_view()),
                     );
                 }
                 let bind_group = self.channel_blit_bg_cache[i].as_ref().unwrap();
@@ -297,7 +297,7 @@ impl Mixer {
                     self.channel_composite_bg_cache[i] = Some(
                         self.composite_pipeline.create_bind_group(
                             &context.device,
-                            &self.channels[i].composite_view,
+                            self.channels[i].composite_view(),
                             &self.effect_ping_view,
                         ),
                     );
@@ -373,7 +373,7 @@ impl Mixer {
             if is_first {
                 // First visible channel: simple blit copy
                 self.blit_pipeline.set_opacity(&context.queue, opacity);
-                let bind_group = self.blit_pipeline.create_bind_group(&context.device, &channel.composite_view);
+                let bind_group = self.blit_pipeline.create_bind_group(&context.device, channel.composite_view());
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Sub-mix Composite Encoder (first)"),
                 });
@@ -410,7 +410,7 @@ impl Mixer {
 
                 let blend_mode = channel.blend_mode;
                 self.composite_pipeline.set_params(&context.queue, opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
-                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &channel.composite_view, &self.effect_ping_view);
+                let bind_group = self.composite_pipeline.create_bind_group(&context.device, channel.composite_view(), &self.effect_ping_view);
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Sub-mix Composite Encoder"),
                 });
