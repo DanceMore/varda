@@ -337,7 +337,7 @@ impl Mixer {
 
     /// Composite a specific subset of channels into the cached sub-mix texture.
     fn composite_sub_mix(&self, indices: &[usize], context: &GpuContext) {
-        let (sub_tex, sub_view, scratch_tex, scratch_view) = match self.sub_mix_cache.get(indices) {
+        let (_sub_tex, sub_view, _scratch_tex, scratch_view) = match self.sub_mix_cache.get(indices) {
             Some(entry) => entry,
             None => return,
         };
@@ -346,84 +346,21 @@ impl Mixer {
         // so sub-mixes get the corrected opacity-compensation math.
         let opacities: Vec<f32> = self.composite_pass_opacities();
 
-        // Submit per-channel to ensure each channel's uniform buffer writes
-        // are consumed before the next channel overwrites them.
-        let mut is_first = true;
-        for &ch_idx in indices {
-            if ch_idx >= self.channels.len() { continue; }
-            let channel = &self.channels[ch_idx];
-            let opacity = opacities.get(ch_idx).copied().unwrap_or(0.0);
-            if opacity <= 0.0 { continue; }
-
-            if is_first {
-                // First visible channel: simple blit copy
-                self.blit_pipeline.set_opacity(&context.queue, opacity);
-                let bind_group = self.blit_pipeline.create_bind_group(&context.device, channel.composite_view());
-                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Sub-mix Composite Encoder (first)"),
-                });
-                {
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Sub-mix Composite Pass (first)"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: sub_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    self.blit_pipeline.render(&mut render_pass, &bind_group);
-                }
-                context.queue.submit(std::iter::once(encoder.finish()));
-                is_first = false;
-            } else {
-                // Subsequent channels: snapshot sub-mix → scratch, composite shader.
-                // Sub-mix keeps the copy (its output identity must stay stable for
-                // external get_sub_mix_view callers), using its own per-entry scratch.
-                let mut copy_encoder = context.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor { label: Some("Sub-mix Snapshot Copy") },
-                );
-                copy_encoder.copy_texture_to_texture(
-                    sub_tex.as_image_copy(),
-                    scratch_tex.as_image_copy(),
-                    sub_tex.size(),
-                );
-
-                let blend_mode = channel.blend_mode;
-                self.composite_pipeline.set_params(&context.queue, opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
-                let bind_group = self.composite_pipeline.create_bind_group(&context.device, channel.composite_view(), scratch_view);
-                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Sub-mix Composite Encoder"),
-                });
-                {
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Sub-mix Composite Pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: sub_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    self.composite_pipeline.render(&mut render_pass, &bind_group);
-                }
-                context.queue.submit([copy_encoder.finish(), encoder.finish()]);
-            }
+        // Collect visible channels in this sub-mix.
+        struct SubMixInfo {
+            ch_idx: usize,
+            opacity: f32,
         }
+        let visible: Vec<SubMixInfo> = indices.iter()
+            .filter_map(|&ch_idx| {
+                if ch_idx >= self.channels.len() { return None; }
+                let opacity = opacities.get(ch_idx).copied().unwrap_or(0.0);
+                if opacity <= 0.0 { return None; }
+                Some(SubMixInfo { ch_idx, opacity })
+            })
+            .collect();
 
-        if is_first {
+        if visible.is_empty() {
             let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Sub-mix Clear Encoder"),
             });
@@ -445,6 +382,85 @@ impl Mixer {
                 });
             }
             context.queue.submit(std::iter::once(encoder.finish()));
+            return;
+        }
+
+        // Composite channels via parity-based target selection: each blend reads
+        // from the previous result and writes to the next target. By calculating
+        // the target for each step based on the total count, we ensure the final
+        // result always lands in `sub_view` without any intermediate full-screen
+        // GPU snapshot copies.
+        let n = visible.len();
+        for (i, info) in visible.iter().enumerate() {
+            let channel = &self.channels[info.ch_idx];
+
+            // Parity: we want the final step (i = n-1) to land in sub_view.
+            // step i writes to T_i, reads from T_{i-1}.
+            // T_{n-1} = sub_view.
+            // T_{n-2} = scratch_view.
+            // T_{n-3} = sub_view.
+            // Target for step i is sub_view if (n - 1 - i) is even.
+            let target = if (n - 1 - i) % 2 == 0 { sub_view } else { scratch_view };
+            let background = if (n - 1 - i) % 2 == 0 { scratch_view } else { sub_view };
+
+            if i == 0 {
+                // First visible channel: simple blit copy into the selected target
+                self.blit_pipeline.set_opacity(&context.queue, info.opacity);
+                let bind_group = self.blit_pipeline.create_bind_group(&context.device, channel.composite_view());
+                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Sub-mix Composite Encoder (first)"),
+                });
+                {
+                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Sub-mix Composite Pass (first)"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.blit_pipeline.render(&mut render_pass, &bind_group);
+                }
+                context.queue.submit(std::iter::once(encoder.finish()));
+            } else {
+                // Subsequent channels: blend channel + background → target (no snapshot)
+                let blend_mode = channel.blend_mode;
+                self.composite_pipeline.set_params(&context.queue, info.opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
+                let bind_group = self.composite_pipeline.create_bind_group(
+                    &context.device,
+                    channel.composite_view(),
+                    background,
+                );
+                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Sub-mix Composite Encoder"),
+                });
+                {
+                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Sub-mix Composite Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.composite_pipeline.render(&mut render_pass, &bind_group);
+                }
+                context.queue.submit(std::iter::once(encoder.finish()));
+            }
         }
     }
 
