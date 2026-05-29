@@ -91,7 +91,8 @@ impl GpuContext {
             .iter()
             .copied()
             .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
+            .or_else(|| surface_caps.formats.first().copied())
+            .context("Surface reports no supported texture formats")?;
 
         // Prefer Immediate to avoid macOS ProMotion throttling the render loop.
         // The UI event loop drives frame pacing via request_redraw().
@@ -111,7 +112,8 @@ impl GpuContext {
             width: size.width,
             height: size.height,
             present_mode,
-            alpha_mode: surface_caps.alpha_modes[0],
+            alpha_mode: surface_caps.alpha_modes.first().copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -451,7 +453,8 @@ impl OutputWindow {
             .iter()
             .copied()
             .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
+            .or_else(|| surface_caps.formats.first().copied())
+            .context("Output surface reports no supported texture formats")?;
 
         // Output windows use Immediate mode for lowest latency to projectors/displays.
         // This avoids output windows throttling the main render loop via vsync contention.
@@ -467,7 +470,8 @@ impl OutputWindow {
             width: size.width,
             height: size.height,
             present_mode,
-            alpha_mode: surface_caps.alpha_modes[0],
+            alpha_mode: surface_caps.alpha_modes.first().copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
             view_formats: vec![],
             desired_maximum_frame_latency: 3,
         };

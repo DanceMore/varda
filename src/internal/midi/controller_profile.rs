@@ -266,13 +266,27 @@ impl ControllerProfileData {
 
 const APC_MINI_PROFILE_JSON: &str = include_str!("apc_mini_profile.json");
 
-/// Load the compiled-in APC Mini mk1 profile.
-pub fn builtin_apc_mini() -> ControllerProfileData {
+/// Load the compiled-in APC Mini mk1 profile, returning an error if the
+/// embedded JSON fails to parse or validate. Used by the production registry
+/// so a malformed build asset degrades to "no built-in profile" instead of
+/// crashing the whole app during MIDI init.
+pub fn try_builtin_apc_mini() -> anyhow::Result<ControllerProfileData> {
     let profile: ControllerProfileData = serde_json::from_str(APC_MINI_PROFILE_JSON)
-        .expect("Built-in APC Mini profile JSON is invalid");
+        .map_err(|e| anyhow::anyhow!("Built-in APC Mini profile JSON is invalid: {}", e))?;
     let errors = profile.validate();
-    assert!(errors.is_empty(), "Built-in APC Mini profile validation failed: {:?}", errors);
-    profile
+    if !errors.is_empty() {
+        anyhow::bail!("Built-in APC Mini profile validation failed: {:?}", errors);
+    }
+    Ok(profile)
+}
+
+/// Load the compiled-in APC Mini mk1 profile, panicking on failure.
+///
+/// The embedded profile is a build invariant — a failure here means the
+/// shipped binary is broken, which the test suite asserts. Production code
+/// paths use [`try_builtin_apc_mini`] instead.
+pub fn builtin_apc_mini() -> ControllerProfileData {
+    try_builtin_apc_mini().expect("Built-in APC Mini profile is invalid")
 }
 
 // ── Profile Registry ──────────────────────────────────────────────
@@ -286,7 +300,13 @@ impl ProfileRegistry {
     /// Create a registry with only the built-in profiles.
     pub fn new() -> Self {
         let mut profiles = Vec::new();
-        profiles.push(Arc::new(builtin_apc_mini()));
+        match try_builtin_apc_mini() {
+            Ok(p) => profiles.push(Arc::new(p)),
+            Err(e) => log::error!(
+                "Built-in APC Mini profile unavailable (APC Mini auto-map/LED disabled): {}",
+                e
+            ),
+        }
         Self { profiles }
     }
 

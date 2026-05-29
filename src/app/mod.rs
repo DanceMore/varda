@@ -69,6 +69,10 @@ pub struct AppConfig {
     /// Disable Syphon (macOS only)
     #[arg(long = "no-syphon")]
     pub syphon_disabled: bool,
+
+    /// Disable MIDI device discovery and I/O entirely
+    #[arg(long = "no-midi")]
+    pub midi_disabled: bool,
 }
 
 impl AppConfig {
@@ -264,7 +268,10 @@ impl VardaApp {
 
         let mut controller_led_mgr = midi::ControllerLedManager::new();
         let mut auto_map_engine = midi::AutoMapEngine::new();
-        let midi_devices = match midi::MidiDeviceManager::new() {
+        let midi_devices = if config.midi_disabled {
+            log::info!("MIDI disabled via --no-midi");
+            None
+        } else { match midi::MidiDeviceManager::new() {
             Ok(mut mgr) => {
                 mgr.load_user_profiles(&workspace.controller_profiles_dir());
                 if workspace.controller_profiles_dir().is_dir() {
@@ -276,7 +283,7 @@ impl VardaApp {
                 Some(mgr)
             }
             Err(e) => { log::warn!("Failed to initialize MIDI: {}", e); None }
-        };
+        }};
 
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let state_tx = std::sync::Arc::new(std::sync::RwLock::new(None));
@@ -1494,7 +1501,7 @@ mod tests {
 
     fn headless_app() -> Option<VardaApp> {
         let gpu = crate::renderer::context::GpuContext::new_headless().ok()?;
-        let config = parse_args(&["--headless", "--no-osc", "--no-ndi", "--no-syphon"]);
+        let config = parse_args(&["--headless", "--no-osc", "--no-ndi", "--no-syphon", "--no-midi"]);
         VardaApp::new(gpu, &config).ok()
     }
 

@@ -354,7 +354,7 @@ impl AudioManager {
                     }
                     let onset_threshold = {
                         let mut sorted = flux_history.clone();
-                        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        sorted.sort_by(|a, b| a.total_cmp(b));
                         if sorted.is_empty() {
                             ONSET_THRESHOLD_OFFSET
                         } else {
@@ -379,7 +379,7 @@ impl AudioManager {
                             if beat_intervals.len() >= 4 {
                                 let mut sorted = beat_intervals.clone();
                                 sorted
-                                    .sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                    .sort_by(|a, b| a.total_cmp(b));
                                 let median = sorted[sorted.len() / 2];
                                 let stable: Vec<f32> = beat_intervals
                                     .iter()

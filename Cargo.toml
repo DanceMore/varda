@@ -52,7 +52,7 @@ image = "0.25.10"
 rfd = "0.17.2"
 snap = "1.1.1"
 nokhwa = { version = "0.10.10", features = ["input-native", "output-threaded"] }
-midir = "0.11"
+midir = { version = "0.11", features = ["avoid_timestamping"] }
 yuvutils-rs = "0.8.3"
 geo = "0.33.1"
 sysinfo = "0.38.4"
