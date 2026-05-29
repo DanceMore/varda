@@ -5,6 +5,7 @@ use crate::params::ShaderParams;
 use crate::renderer::{GpuContext, UnifiedPipeline, ISFUniforms};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 use super::{Effect, Deck, PassBuffer};
 use super::source::load_imported_textures;
 
@@ -141,7 +142,7 @@ impl Effect {
         let placeholder_view = placeholder_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let uuid = crate::deck::generate_short_uuid();
-        let mod_prefix = format!("fx_{}", uuid);
+        let mod_prefix = Arc::from(format!("fx_{}", uuid));
         Ok(Self {
             uuid,
             mod_prefix,

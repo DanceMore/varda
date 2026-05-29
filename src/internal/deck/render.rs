@@ -359,6 +359,7 @@ impl Deck {
             } else {
                 (&self.texture_view, &self.texture_b_view)
             };
+            // Clone is cheap because mod_prefix is an Arc<str>
             let fx_prefix = self.effects[effect_idx].mod_prefix.clone();
             self.effects[effect_idx].apply_with_modulation(
                 context, input_view, output_view, &uniforms,

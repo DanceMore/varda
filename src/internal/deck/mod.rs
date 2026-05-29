@@ -9,6 +9,7 @@ use crate::params::ShaderParams;
 use crate::renderer::{UnifiedPipeline, BlitPipeline, HapConvertPipeline};
 use crate::video::{VideoPlayer, HapTextureFormat, hap::HapPlayer};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Generate a short 8-character hex UUID for entity identity.
@@ -184,7 +185,7 @@ pub struct Effect {
     /// Stable UUID for this effect (8-char hex)
     pub uuid: String,
     /// Cached "fx_{uuid}" modulation prefix; reused every frame.
-    pub mod_prefix: String,
+    pub mod_prefix: Arc<str>,
     pub shader: ISFShader,
     pub pipeline: UnifiedPipeline,
     pub enabled: bool,
@@ -235,7 +236,7 @@ pub struct Deck {
     /// Cached "deck_{uuid}" modulation prefix. Built once at construction and
     /// reused every frame to avoid per-frame format!() allocations in the
     /// channel/deck render path.
-    pub mod_prefix: String,
+    pub mod_prefix: Arc<str>,
 
     /// Name of this deck's source
     source_name: String,
@@ -298,7 +299,7 @@ impl Deck {
 
     /// Set the UUID (used during scene restore to preserve identity)
     pub fn set_uuid(&mut self, uuid: String) {
-        self.mod_prefix = format!("deck_{}", uuid);
+        self.mod_prefix = Arc::from(format!("deck_{}", uuid));
         self.uuid = uuid;
     }
 
