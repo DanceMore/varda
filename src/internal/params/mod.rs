@@ -100,8 +100,11 @@ impl ParamValue {
 pub struct ShaderParams {
     /// Parameter names in order (for consistent buffer layout)
     pub param_order: Vec<String>,
-    /// Current values
-    pub values: HashMap<String, ParamValue>,
+    /// Fast name-to-index mapping for `values` vector
+    #[serde(skip)]
+    pub name_to_idx: HashMap<String, usize>,
+    /// Current values (matched to `param_order`)
+    pub values: Vec<ParamValue>,
     /// ISF input definitions (for UI metadata: min/max/label)
     pub definitions: HashMap<String, ISFInput>,
     /// GPU buffer (created on demand)
@@ -117,29 +120,41 @@ pub struct ShaderParams {
     /// Whether the cached keys are valid for the current prefix.
     #[serde(skip)]
     cached_keys_valid: bool,
+    /// Per-parameter modulation status cache
+    #[serde(skip)]
+    is_modulated: Vec<bool>,
+    /// The `ModulationEngine` version when `is_modulated` was last updated
+    #[serde(skip)]
+    last_mod_version: u64,
 }
 
 impl ShaderParams {
     /// Create from ISF inputs
     pub fn from_inputs(inputs: &[ISFInput]) -> Self {
         let mut param_order = Vec::new();
-        let mut values = HashMap::new();
+        let mut name_to_idx = HashMap::new();
+        let mut values = Vec::new();
         let mut definitions = HashMap::new();
 
         for input in inputs {
             // Skip non-parameter types (image, audio, audioFFT handled separately)
             match input.input_type.as_str() {
                 "float" | "bool" | "long" | "color" | "point2D" => {
+                    let idx = values.len();
                     param_order.push(input.name.clone());
-                    values.insert(input.name.clone(), ParamValue::from_isf_input(input));
+                    name_to_idx.insert(input.name.clone(), idx);
+                    values.push(ParamValue::from_isf_input(input));
                     definitions.insert(input.name.clone(), input.clone());
                 }
                 _ => {} // Skip image, audio, audioFFT, event
             }
         }
 
+        let is_modulated = vec![false; values.len()];
+
         Self {
             param_order,
+            name_to_idx,
             values,
             definitions,
             buffer: None,
@@ -147,6 +162,8 @@ impl ShaderParams {
             cached_mod_keys: Vec::new(),
             last_mod_prefix: None,
             cached_keys_valid: false,
+            is_modulated,
+            last_mod_version: 0,
         }
     }
 
@@ -155,9 +172,23 @@ impl ShaderParams {
         self.param_order.is_empty()
     }
 
+    /// Get a parameter value by name
+    pub fn get(&self, name: &str) -> Option<&ParamValue> {
+        self.name_to_idx.get(name).and_then(|&idx| self.values.get(idx))
+    }
+
+    /// Get a mutable reference to a parameter value by name
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut ParamValue> {
+        if let Some(&idx) = self.name_to_idx.get(name) {
+            self.dirty = true;
+            return self.values.get_mut(idx);
+        }
+        None
+    }
+
     /// Get a float value
     pub fn get_float(&self, name: &str) -> Option<f32> {
-        match self.values.get(name) {
+        match self.get(name) {
             Some(ParamValue::Float(v)) => Some(*v),
             _ => None,
         }
@@ -165,7 +196,7 @@ impl ShaderParams {
 
     /// Set a float value
     pub fn set_float(&mut self, name: &str, value: f32) {
-        if let Some(ParamValue::Float(v)) = self.values.get_mut(name) {
+        if let Some(ParamValue::Float(v)) = self.get_mut(name) {
             *v = value;
             self.dirty = true;
         }
@@ -173,7 +204,7 @@ impl ShaderParams {
 
     /// Get a bool value
     pub fn get_bool(&self, name: &str) -> Option<bool> {
-        match self.values.get(name) {
+        match self.get(name) {
             Some(ParamValue::Bool(v)) => Some(*v),
             _ => None,
         }
@@ -181,7 +212,7 @@ impl ShaderParams {
 
     /// Set a bool value
     pub fn set_bool(&mut self, name: &str, value: bool) {
-        if let Some(ParamValue::Bool(v)) = self.values.get_mut(name) {
+        if let Some(ParamValue::Bool(v)) = self.get_mut(name) {
             *v = value;
             self.dirty = true;
         }
@@ -189,7 +220,7 @@ impl ShaderParams {
 
     /// Get a color value
     pub fn get_color(&self, name: &str) -> Option<[f32; 4]> {
-        match self.values.get(name) {
+        match self.get(name) {
             Some(ParamValue::Color(v)) => Some(*v),
             _ => None,
         }
@@ -197,7 +228,7 @@ impl ShaderParams {
 
     /// Set a color value
     pub fn set_color(&mut self, name: &str, value: [f32; 4]) {
-        if let Some(ParamValue::Color(v)) = self.values.get_mut(name) {
+        if let Some(ParamValue::Color(v)) = self.get_mut(name) {
             *v = value;
             self.dirty = true;
         }
@@ -205,7 +236,7 @@ impl ShaderParams {
 
     /// Get a long (enum) value
     pub fn get_long(&self, name: &str) -> Option<i32> {
-        match self.values.get(name) {
+        match self.get(name) {
             Some(ParamValue::Long(v)) => Some(*v),
             _ => None,
         }
@@ -213,7 +244,7 @@ impl ShaderParams {
 
     /// Set a long value
     pub fn set_long(&mut self, name: &str, value: i32) {
-        if let Some(ParamValue::Long(v)) = self.values.get_mut(name) {
+        if let Some(ParamValue::Long(v)) = self.get_mut(name) {
             *v = value;
             self.dirty = true;
         }
@@ -221,7 +252,7 @@ impl ShaderParams {
 
     /// Get a point2D value
     pub fn get_point2d(&self, name: &str) -> Option<[f32; 2]> {
-        match self.values.get(name) {
+        match self.get(name) {
             Some(ParamValue::Point2D(v)) => Some(*v),
             _ => None,
         }
@@ -229,7 +260,7 @@ impl ShaderParams {
 
     /// Set a point2D value
     pub fn set_point2d(&mut self, name: &str, value: [f32; 2]) {
-        if let Some(ParamValue::Point2D(v)) = self.values.get_mut(name) {
+        if let Some(ParamValue::Point2D(v)) = self.get_mut(name) {
             *v = value;
             self.dirty = true;
         }
@@ -238,18 +269,16 @@ impl ShaderParams {
     /// Calculate total buffer size (with std140 alignment)
     pub fn buffer_size(&self) -> usize {
         let mut size = 0usize;
-        for name in &self.param_order {
-            if let Some(value) = self.values.get(name) {
-                // std140 alignment rules
-                let alignment = match value {
-                    ParamValue::Float(_) | ParamValue::Bool(_) | ParamValue::Long(_) => 4,
-                    ParamValue::Point2D(_) => 8,
-                    ParamValue::Color(_) => 16,
-                };
-                // Align to required alignment
-                size = (size + alignment - 1) & !(alignment - 1);
-                size += value.byte_size();
-            }
+        for value in &self.values {
+            // std140 alignment rules
+            let alignment = match value {
+                ParamValue::Float(_) | ParamValue::Bool(_) | ParamValue::Long(_) => 4,
+                ParamValue::Point2D(_) => 8,
+                ParamValue::Color(_) => 16,
+            };
+            // Align to required alignment
+            size = (size + alignment - 1) & !(alignment - 1);
+            size += value.byte_size();
         }
         // Minimum 16 bytes for wgpu, align to 16
         (size.max(16) + 15) & !15
@@ -258,21 +287,19 @@ impl ShaderParams {
     /// Build byte buffer for GPU upload (respects std140 alignment rules)
     pub fn build_buffer_data(&self) -> Vec<u8> {
         let mut data = Vec::with_capacity(self.buffer_size());
-        for name in &self.param_order {
-            if let Some(value) = self.values.get(name) {
-                // std140 alignment rules:
-                // - float, bool, int: 4-byte alignment
-                // - vec2: 8-byte alignment
-                // - vec3, vec4: 16-byte alignment
-                let alignment = match value {
-                    ParamValue::Float(_) | ParamValue::Bool(_) | ParamValue::Long(_) => 4,
-                    ParamValue::Point2D(_) => 8,
-                    ParamValue::Color(_) => 16,
-                };
-                // Pad to required alignment
-                while data.len() % alignment != 0 { data.push(0); }
-                value.write_bytes(&mut data);
-            }
+        for value in &self.values {
+            // std140 alignment rules:
+            // - float, bool, int: 4-byte alignment
+            // - vec2: 8-byte alignment
+            // - vec3, vec4: 16-byte alignment
+            let alignment = match value {
+                ParamValue::Float(_) | ParamValue::Bool(_) | ParamValue::Long(_) => 4,
+                ParamValue::Point2D(_) => 8,
+                ParamValue::Color(_) => 16,
+            };
+            // Pad to required alignment
+            while data.len() % alignment != 0 { data.push(0); }
+            value.write_bytes(&mut data);
         }
         // Pad to minimum 16 bytes
         while data.len() < 16 { data.push(0); }
@@ -318,21 +345,35 @@ impl ShaderParams {
 
     /// Generic set method for any parameter value
     pub fn set(&mut self, name: &str, value: ParamValue) {
-        if self.values.contains_key(name) {
-            self.values.insert(name.to_string(), value);
+        if let Some(v) = self.get_mut(name) {
+            *v = value;
             self.dirty = true;
         }
     }
 
     /// Reset all parameters to their default values from ISF definitions
     pub fn reset_to_defaults(&mut self) {
-        for name in &self.param_order {
+        for (i, name) in self.param_order.iter().enumerate() {
             if let Some(definition) = self.definitions.get(name) {
                 let default_value = ParamValue::from_isf_input(definition);
-                self.values.insert(name.clone(), default_value);
+                self.values[i] = default_value;
             }
         }
         self.dirty = true;
+    }
+
+    /// Build a HashMap of all current parameter values (for persistence/UI)
+    pub fn values_map(&self) -> HashMap<String, ParamValue> {
+        self.param_order.iter().enumerate().map(|(i, name)| {
+            (name.clone(), self.values[i])
+        }).collect()
+    }
+
+    /// Set multiple parameters from a HashMap (for persistence/REST API)
+    pub fn update_from_map(&mut self, map: &HashMap<String, ParamValue>) {
+        for (name, value) in map {
+            self.set(name, *value);
+        }
     }
 
     /// Pre-format modulation keys for the current prefix.
@@ -358,24 +399,42 @@ impl ShaderParams {
     /// This creates a temporary modulated value for GPU upload without modifying base values
     /// `param_prefix` is used to look up modulation (e.g., "deck0" to look up "deck0:paramname")
     pub fn build_modulated_buffer_data(&mut self, modulation: &ModulationEngine, param_prefix: Option<&str>) -> Vec<u8> {
+        // Check if prefix changed before ensure_mod_keys updates it
+        let prefix_changed = self.last_mod_prefix.as_deref() != param_prefix;
         self.ensure_mod_keys(param_prefix);
+
+        // Refresh modulation cache if version or prefix changed.
+        // We only perform the expensive ModulationEngine hash lookups when the
+        // topology changes (version increment) or the entity is re-prefixed.
+        if self.last_mod_version != modulation.version || prefix_changed {
+            for (i, _name) in self.param_order.iter().enumerate() {
+                let mod_key = &self.cached_mod_keys[i];
+                self.is_modulated[i] = modulation.has_modulation(mod_key);
+            }
+            self.last_mod_version = modulation.version;
+        }
+
         let mut data = Vec::with_capacity(self.buffer_size());
 
-        for (i, name) in self.param_order.iter().enumerate() {
-            if let Some(value) = self.values.get(name) {
-                // std140 alignment rules
-                let alignment = match value {
-                    ParamValue::Float(_) | ParamValue::Bool(_) | ParamValue::Long(_) => 4,
-                    ParamValue::Point2D(_) => 8,
-                    ParamValue::Color(_) => 16,
-                };
-                // Pad to required alignment
-                while data.len() % alignment != 0 { data.push(0); }
+        for i in 0..self.values.len() {
+            let value = &self.values[i];
+            // std140 alignment rules
+            let alignment = match value {
+                ParamValue::Float(_) | ParamValue::Bool(_) | ParamValue::Long(_) => 4,
+                ParamValue::Point2D(_) => 8,
+                ParamValue::Color(_) => 16,
+            };
+            // Pad to required alignment
+            while data.len() % alignment != 0 { data.push(0); }
 
-                // Apply modulation using pre-formatted key and write
+            // Skip modulation lookup if we know it's not modulated
+            if self.is_modulated[i] {
+                let name = &self.param_order[i];
                 let mod_key = &self.cached_mod_keys[i];
                 let modulated = self.apply_modulation_to_value(name, value, modulation, mod_key);
                 modulated.write_bytes(&mut data);
+            } else {
+                value.write_bytes(&mut data);
             }
         }
         // Pad to minimum 16 bytes
@@ -625,6 +684,7 @@ mod tests {
         ];
         let params = ShaderParams::from_inputs(&inputs);
         assert_eq!(params.param_order.len(), 1); // image skipped
+        assert_eq!(params.values.len(), 1);
     }
 
     #[test]

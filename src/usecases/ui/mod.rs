@@ -1328,8 +1328,8 @@ pub struct SequenceStepDrag {
 
 /// Helper to extract params from ShaderParams for UI display
 pub fn collect_params(params: &ShaderParams) -> Vec<ParamUIInfo> {
-    params.param_order.iter().filter_map(|name| {
-        let value = params.values.get(name)?;
+    params.param_order.iter().enumerate().filter_map(|(i, name)| {
+        let value = params.values.get(i)?;
         let def = params.definitions.get(name);
         Some(ParamUIInfo {
             name: name.clone(),

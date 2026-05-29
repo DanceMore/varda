@@ -131,8 +131,8 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
 }
 
 fn build_shader_params(shader_name: &str, params: &crate::params::ShaderParams) -> ShaderParamsSnapshot {
-    let params_vec = params.param_order.iter().filter_map(|name| {
-        let value = params.values.get(name)?;
+    let params_vec = params.param_order.iter().enumerate().filter_map(|(i, name)| {
+        let value = params.values.get(i)?;
         let def = params.definitions.get(name);
         Some(ParamSnapshot {
             name: name.clone(),
@@ -736,7 +736,7 @@ mod tests {
         // param_order has "brightness" but values doesn't → filtered out
         let mut params = crate::params::ShaderParams::from_inputs(&[]);
         params.param_order.push("brightness".into());
-        // values map is empty, so "brightness" has no value → should be filtered
+        // values is empty, so "brightness" has no value → should be filtered
         let snap = build_shader_params("test_shader", &params);
         assert!(snap.params.is_empty());
     }
@@ -746,7 +746,8 @@ mod tests {
         // Value exists but no definition → label/min/max are None
         let mut params = crate::params::ShaderParams::from_inputs(&[]);
         params.param_order.push("mystery".into());
-        params.values.insert("mystery".into(), crate::params::ParamValue::Float(0.5));
+        params.name_to_idx.insert("mystery".into(), 0);
+        params.values.push(crate::params::ParamValue::Float(0.5));
         let snap = build_shader_params("test_shader", &params);
         assert_eq!(snap.params.len(), 1);
         let p = &snap.params[0];
