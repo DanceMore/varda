@@ -527,9 +527,8 @@ impl Channel {
                 active_count += 1;
                 // Use the cached "deck_{uuid}" prefix to avoid a per-frame
                 // format!() allocation on the channel render hot path.
-                // Clone is unavoidable here because render_with_prefix borrows
-                // self.deck mutably; the alternative is plumbing a separate
-                // borrow path. The clone is one short String (≈11 bytes) and
+                // Clone is cheap here because mod_prefix is an Arc<str>; the
+                // alternative is plumbing a separate borrow path. This clone
                 // happens once per visible deck per frame.
                 let param_prefix = slot.deck.mod_prefix.clone();
                 slot.deck.render_with_prefix(context, audio_data, modulation, &param_prefix, &mut cmd_buffers)?;
@@ -816,8 +815,9 @@ impl Channel {
                 let output_view = self.composite.target_view();
 
                 // Use the cached "fx_{uuid}" prefix to avoid per-frame
-                // allocation. Clone needed because effect is borrowed mutably
-                // below via apply_with_modulation.
+                // allocation. Clone is cheap here because mod_prefix is an Arc<str>;
+                // needed because effect is borrowed mutably below via
+                // apply_with_modulation.
                 let fx_prefix = effect.mod_prefix.clone();
                 if let Err(e) = effect.apply_with_modulation(context, input_view, output_view, &uniforms, Some(modulation), Some(&fx_prefix), &mut fx_cmd_buffers) {
                     log::warn!("Effect {} failed, skipping: {}", _eff_idx, e);

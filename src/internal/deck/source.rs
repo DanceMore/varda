@@ -6,6 +6,7 @@ use crate::renderer::{GpuContext, UnifiedPipeline, BlitPipeline, HapConvertPipel
 use crate::video::{VideoPlayer, HapTextureFormat, hap::HapPlayer};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::path::Path;
 use std::time::Instant;
 use super::{Deck, DeckSource, ExternalSourceKind, ScalingMode, PassBuffer, Effect};
@@ -267,7 +268,7 @@ impl Deck {
         };
 
         let uuid = super::generate_short_uuid();
-        let mod_prefix = format!("deck_{}", uuid);
+        let mod_prefix = Arc::from(format!("deck_{}", uuid));
         Ok(Self {
             uuid,
             mod_prefix,
@@ -596,7 +597,7 @@ impl Deck {
         let generator_params = ShaderParams::from_inputs(&[]);
 
         let uuid = super::generate_short_uuid();
-        let mod_prefix = format!("deck_{}", uuid);
+        let mod_prefix = Arc::from(format!("deck_{}", uuid));
         Ok(Self {
             uuid,
             mod_prefix,
