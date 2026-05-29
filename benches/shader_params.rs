@@ -78,7 +78,7 @@ fn bench_shader_params_buffer(c: &mut Criterion) {
     g.sample_size(500);
 
     for n_floats in [2usize, 6, 14] {
-        let params = make_params(n_floats);
+        let mut params = make_params(n_floats);
         let total = n_floats + 2;
         let lfo_key = format!("deck0:p0");
         let eng_empty = ModulationEngine::new();
