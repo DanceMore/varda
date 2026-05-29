@@ -309,7 +309,7 @@ pub fn snapshot_scene(
                         .to_string();
                     SourceConfig::Shader {
                         path,
-                        params: slot.deck.generator_params.values.clone(),
+                        params: slot.deck.generator_params.values_map(),
                     }
                 }
                 "video" => {
@@ -383,7 +383,7 @@ pub fn snapshot_scene(
                     uuid: eff.uuid.clone(),
                     path: eff.shader.file_path.clone().unwrap_or_default(),
                     enabled: eff.enabled,
-                    params: eff.params.values.clone(),
+                    params: eff.params.values_map(),
                 }
             }).collect();
 
@@ -424,7 +424,7 @@ pub fn snapshot_scene(
                     uuid: eff.uuid.clone(),
                 path: eff.shader.file_path.clone().unwrap_or_default(),
                 enabled: eff.enabled,
-                params: eff.params.values.clone(),
+                params: eff.params.values_map(),
             }
         }).collect();
 
@@ -443,7 +443,7 @@ pub fn snapshot_scene(
                     uuid: eff.uuid.clone(),
             path: eff.shader.file_path.clone().unwrap_or_default(),
             enabled: eff.enabled,
-            params: eff.params.values.clone(),
+            params: eff.params.values_map(),
         }
     }).collect();
 
@@ -875,9 +875,7 @@ pub(crate) fn restore_deck(
                 .with_context(|| format!("Failed to load shader: {}", path))?;
             let mut deck = Deck::new(context, shader, render_width, render_height)?;
             // Restore parameter values
-            for (name, value) in params {
-                deck.generator_params.set(name, *value);
-            }
+            deck.generator_params.update_from_map(params);
             deck
         }
         SourceConfig::Video { path, loop_mode, speed, in_point, out_point } => {
@@ -1009,9 +1007,7 @@ pub(crate) fn restore_effect(config: &EffectConfig, context: &GpuContext, target
     effect.uuid = config.uuid.clone();
     effect.enabled = config.enabled;
     // Restore parameter values
-    for (name, value) in &config.params {
-        effect.params.set(name, *value);
-    }
+    effect.params.update_from_map(&config.params);
     Ok(effect)
 }
 

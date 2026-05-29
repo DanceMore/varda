@@ -418,7 +418,7 @@ impl VardaApp {
 
         // Patch generator params for shader sources
         if let crate::scene::SourceConfig::Shader { params, .. } = &config.source {
-            slot.deck.generator_params.values = params.clone();
+            slot.deck.generator_params.update_from_map(params);
         }
 
         // Patch solid color
@@ -487,7 +487,7 @@ impl VardaApp {
             if current_path == cfg.path {
                 // Same shader — patch params + enabled (zero cost)
                 eff.enabled = cfg.enabled;
-                eff.params.values = cfg.params.clone();
+                eff.params.update_from_map(&cfg.params);
             } else {
                 // Different shader — rebuild this effect
                 match crate::persistence::restore_effect(cfg, context, target_format) {

@@ -28,6 +28,10 @@ pub struct ModulationEngine {
     cached_order: Vec<usize>,
     #[serde(skip)]
     cached_order_valid: bool,
+    /// Version counter incremented whenever sources or assignments mutate.
+    /// Used by `ShaderParams` to cache "is modulated" status.
+    #[serde(default)]
+    pub version: u64,
 }
 
 impl ModulationEngine {
@@ -56,6 +60,7 @@ impl ModulationEngine {
         self.current_values.push(0.0);
         self.uuid_to_idx.insert(uuid.clone(), self.sources.len() - 1);
         self.invalidate_evaluation_order();
+        self.version += 1;
         uuid
     }
 
@@ -67,6 +72,7 @@ impl ModulationEngine {
         self.current_values.push(0.0);
         self.uuid_to_idx.insert(uuid.clone(), self.sources.len() - 1);
         self.invalidate_evaluation_order();
+        self.version += 1;
         uuid
     }
 
@@ -85,6 +91,7 @@ impl ModulationEngine {
             self.assignments.retain(|k, _| !k.starts_with(&mod_prefix));
             self.rebuild_uuid_index();
             self.invalidate_evaluation_order();
+            self.version += 1;
         }
     }
 
@@ -97,6 +104,7 @@ impl ModulationEngine {
         if removed > 0 {
             log::info!("Removed {} orphaned modulation assignments with prefix '{}'", removed, prefix);
             self.invalidate_evaluation_order();
+            self.version += 1;
         }
     }
 
@@ -111,22 +119,28 @@ impl ModulationEngine {
         // don't change evaluation order but invalidating universally keeps
         // the cache invariant simple.
         self.invalidate_evaluation_order();
+        self.version += 1;
     }
 
     pub fn assign_mod_on_mod(&mut self, target_uuid: &str, param_name: &str, modulator_uuid: &str, amount: f32) {
         let key = format!("mod:{}:{}", target_uuid, param_name);
         self.assign(&key, modulator_uuid, amount, None);
+        // assign() already increments version
     }
 
     pub fn clear_mod_on_mod(&mut self, target_uuid: &str, param_name: &str) {
         let key = format!("mod:{}:{}", target_uuid, param_name);
-        self.assignments.remove(&key);
-        self.invalidate_evaluation_order();
+        if self.assignments.remove(&key).is_some() {
+            self.invalidate_evaluation_order();
+            self.version += 1;
+        }
     }
 
     pub fn clear_assignments(&mut self, param_name: &str) {
-        self.assignments.remove(param_name);
-        self.invalidate_evaluation_order();
+        if self.assignments.remove(param_name).is_some() {
+            self.invalidate_evaluation_order();
+            self.version += 1;
+        }
     }
 
     pub fn trigger_adsr(&mut self, uuid: &str) {
