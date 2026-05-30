@@ -405,7 +405,8 @@ impl Deck {
             phase_times,
         };
 
-        pipeline.update_uniforms(&context.queue, &uniforms);
+        let slot_idx = 0;
+        pipeline.set_uniforms_at_slot(&context.queue, &uniforms, slot_idx);
 
         generator_params.ensure_buffer(&context.device);
         generator_params.update_buffer_with_modulation(&context.queue, modulation, Some(param_prefix));
@@ -438,9 +439,7 @@ impl Deck {
                 occlusion_query_set: None,
             });
 
-            render_pass.set_pipeline(&pipeline.pipeline);
-            render_pass.set_bind_group(0, &bind_group, &[]);
-            render_pass.draw(0..3, 0..1);
+            pipeline.render_with_slot(&mut render_pass, &pipeline.pipeline, &bind_group, slot_idx);
         }
 
         cmd_buffers.push(encoder.finish());
@@ -472,6 +471,7 @@ impl Deck {
         let user_params_buffer = generator_params.buffer().expect("Buffer should exist after ensure_buffer");
 
         const SIMULATION_ITERATIONS: usize = 4;
+        let mut slot_idx: usize = 0;
 
         for pass_idx in 0..passes.len() {
             let pass = &passes[pass_idx];
@@ -522,7 +522,11 @@ impl Deck {
                     phase_times,
                 };
 
-                multi_pass.update_uniforms(&context.queue, &uniforms);
+                if slot_idx < crate::renderer::MAX_RENDER_SLOTS {
+                    multi_pass.set_uniforms_at_slot(&context.queue, &uniforms, slot_idx);
+                } else {
+                    multi_pass.update_uniforms(&context.queue, &uniforms);
+                }
 
                 let pass_buffer_views: Vec<&wgpu::TextureView> = passes
                     .iter()
@@ -559,15 +563,27 @@ impl Deck {
                         occlusion_query_set: None,
                     });
 
-                    render_pass.set_pipeline(multi_pass.pipeline_for_format(format));
-                    render_pass.set_bind_group(0, &bind_group, &[]);
-                    render_pass.draw(0..3, 0..1);
+                    let pipeline = multi_pass.pipeline_for_format(format);
+                    if slot_idx < crate::renderer::MAX_RENDER_SLOTS {
+                        multi_pass.render_with_slot(&mut render_pass, pipeline, &bind_group, slot_idx);
+                        slot_idx += 1;
+                    } else {
+                        render_pass.set_pipeline(pipeline);
+                        render_pass.set_bind_group(0, &bind_group, &[]);
+                        render_pass.draw(0..3, 0..1);
+                    }
                 }
 
-                // Multipass intermediate passes MUST submit immediately —
-                // update_uniforms() overwrites the same buffer each iteration,
-                // so batching would cause all passes to see the last pass's data.
-                context.queue.submit(std::iter::once(encoder.finish()));
+                // If we've run out of slots, we must flush the accumulated commands
+                // to the GPU before we can reuse slot 0 for the next batch.
+                // This ensures execution order and prevents uniform data corruption.
+                if slot_idx >= crate::renderer::MAX_RENDER_SLOTS {
+                    cmd_buffers.push(encoder.finish());
+                    context.queue.submit(cmd_buffers.drain(..));
+                    slot_idx = 0;
+                } else {
+                    cmd_buffers.push(encoder.finish());
+                }
 
                 if let Some(pb) = pass_buffers.get_mut(target_name) {
                     pb.swap();
@@ -593,7 +609,11 @@ impl Deck {
                 phase_times,
             };
 
-            multi_pass.update_uniforms(&context.queue, &uniforms);
+            if slot_idx < crate::renderer::MAX_RENDER_SLOTS {
+                multi_pass.set_uniforms_at_slot(&context.queue, &uniforms, slot_idx);
+            } else {
+                multi_pass.update_uniforms(&context.queue, &uniforms);
+            }
 
             let pass_buffer_views: Vec<&wgpu::TextureView> = passes
                 .iter()
@@ -626,9 +646,14 @@ impl Deck {
                     occlusion_query_set: None,
                 });
 
-                render_pass.set_pipeline(multi_pass.pipeline_for_format(wgpu::TextureFormat::Rgba8Unorm));
-                render_pass.set_bind_group(0, &bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
+                let pipeline = multi_pass.pipeline_for_format(wgpu::TextureFormat::Rgba8Unorm);
+                if slot_idx < crate::renderer::MAX_RENDER_SLOTS {
+                    multi_pass.render_with_slot(&mut render_pass, pipeline, &bind_group, slot_idx);
+                } else {
+                    render_pass.set_pipeline(pipeline);
+                    render_pass.set_bind_group(0, &bind_group, &[]);
+                    render_pass.draw(0..3, 0..1);
+                }
             }
 
             cmd_buffers.push(encoder.finish());

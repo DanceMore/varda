@@ -2,10 +2,7 @@
 use anyhow::Result;
 use wgpu::util::DeviceExt;
 use super::edge_blend::SurfaceOverlapZones;
-
-/// Maximum number of parameter slots available for batched rendering.
-/// Covers all decks in a channel or all channels in the mixer.
-pub const MAX_RENDER_SLOTS: usize = 128;
+use super::MAX_RENDER_SLOTS;
 
 /// Uniform buffer for blit parameters - 32 bytes (8 x f32)
 #[repr(C)]
