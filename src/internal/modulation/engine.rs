@@ -322,12 +322,17 @@ impl ModulationEngine {
     /// Result is cached and reused across frames; mutators must call
     /// `invalidate_evaluation_order()` after touching `sources` or
     /// `assignments`.
-    pub(crate) fn evaluation_order(&mut self) -> Vec<usize> {
+    pub(crate) fn evaluation_order(&mut self) -> &[usize] {
         self.ensure_index();
         if self.cached_order_valid && self.cached_order.len() == self.sources.len() {
-            return self.cached_order.clone();
+            return &self.cached_order;
         }
 
+        self.rebuild_evaluation_order();
+        &self.cached_order
+    }
+
+    fn rebuild_evaluation_order(&mut self) {
         self.resolve_mod_on_mod_cache();
 
         const MAX_MOD_DEPTH: usize = 4;
@@ -335,7 +340,7 @@ impl ModulationEngine {
         self.cached_order.clear();
         if n == 0 {
             self.cached_order_valid = true;
-            return Vec::new();
+            return;
         }
 
         let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -376,9 +381,8 @@ impl ModulationEngine {
                 order.push(i);
             }
         }
-        self.cached_order = order.clone();
+        self.cached_order = order;
         self.cached_order_valid = true;
-        order
     }
 
     /// Parse mod-on-mod key: "mod:{uuid}:{param}" → Some(uuid)
@@ -397,15 +401,19 @@ impl ModulationEngine {
         let dt = self.prev_time.map_or(0.016, |prev| time - prev);
         self.prev_time = Some(time);
 
-        while self.prev_values.len() < self.sources.len() {
-            self.prev_values.push(0.0);
+        let n = self.sources.len();
+        if self.prev_values.len() < n {
+            self.prev_values.resize(n, 0.0);
         }
-        while self.current_values.len() < self.sources.len() {
-            self.current_values.push(0.0);
+        if self.current_values.len() < n {
+            self.current_values.resize(n, 0.0);
         }
 
-        let order = self.evaluation_order();
-        for i in order {
+        // We use indices to iterate to avoid borrowing self while mutating it in the loop.
+        self.evaluation_order(); // Ensure cache is valid
+        for i_idx in 0..n {
+            let i = self.cached_order[i_idx];
+
             // Optimization: avoid cloning and applying mod-on-mod if no assignments exist for this source
             let value = if self.resolved_mod_on_mod[i].is_empty() {
                 self.sources[i]
