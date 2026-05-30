@@ -3,6 +3,10 @@ use anyhow::Result;
 use wgpu::util::DeviceExt;
 use super::edge_blend::SurfaceOverlapZones;
 
+/// Maximum number of parameter slots available for batched rendering.
+/// Covers all decks in a channel or all channels in the mixer.
+pub const MAX_RENDER_SLOTS: usize = 128;
+
 /// Uniform buffer for blit parameters - 32 bytes (8 x f32)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -21,6 +25,8 @@ pub struct BlitPipeline {
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     params_buffer: wgpu::Buffer,
+    /// Byte stride between parameter slots, aligned to device requirements.
+    slot_stride: u32,
 }
 
 impl BlitPipeline {
@@ -31,6 +37,10 @@ impl BlitPipeline {
 
     /// Create a blit pipeline with a specific blend state
     pub fn with_blend(device: &wgpu::Device, target_format: wgpu::TextureFormat, blend_state: wgpu::BlendState) -> Result<Self> {
+        let alignment = device.limits().min_uniform_buffer_offset_alignment as usize;
+        let param_size = std::mem::size_of::<BlitParams>();
+        let slot_stride = ((param_size + alignment - 1) / alignment * alignment) as u32;
+
         // Create bind group layout
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Blit Bind Group Layout"),
@@ -53,32 +63,31 @@ impl BlitPipeline {
                     },
                     count: None,
                 },
-                // Params uniform buffer (opacity)
+                // Params uniform buffer (opacity) - with dynamic offset for batching
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(param_size as u64),
                     },
                     count: None,
                 },
             ],
         });
 
-        // Create params buffer with default opacity of 1.0
-        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // Create multi-slot params buffer
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Blit Params Buffer"),
-            contents: bytemuck::cast_slice(&[BlitParams {
-                opacity: 1.0,
-                rotation: 0,
-                uv_scale: [1.0, 1.0],
-                uv_offset: [0.0, 0.0],
-                _pad2: [0.0, 0.0],
-            }]),
+            size: (MAX_RENDER_SLOTS as u64 * slot_stride as u64),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+
+        // Note: we'll use queue.write_buffer for updates.
+        // Buffer is allocated but not initialized with DeviceExt::create_buffer_init
+        // to avoid unnecessary intermediate buffer creation.
 
         // Create pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -154,6 +163,7 @@ impl BlitPipeline {
             bind_group_layout,
             sampler,
             params_buffer,
+            slot_stride,
         })
     }
 
@@ -173,15 +183,20 @@ impl BlitPipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.params_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.params_buffer,
+                        offset: 0,
+                        size: Some(std::num::NonZeroU64::new(std::mem::size_of::<BlitParams>() as u64).unwrap()),
+                    }),
                 },
             ],
         })
     }
 
-    /// Update the opacity value (call before render)
-    pub fn set_opacity(&self, queue: &wgpu::Queue, opacity: f32) {
-        queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[BlitParams {
+    /// Update the opacity value in a specific slot (call before render)
+    pub fn set_opacity_at_slot(&self, queue: &wgpu::Queue, opacity: f32, slot_idx: usize) {
+        let offset = (slot_idx as u64 * self.slot_stride as u64) as wgpu::BufferAddress;
+        queue.write_buffer(&self.params_buffer, offset, bytemuck::cast_slice(&[BlitParams {
             opacity,
             rotation: 0,
             uv_scale: [1.0, 1.0],
@@ -190,9 +205,15 @@ impl BlitPipeline {
         }]));
     }
 
-    /// Set UV transform parameters for scaling modes
-    pub fn set_uv_transform(&self, queue: &wgpu::Queue, opacity: f32, uv_scale: [f32; 2], uv_offset: [f32; 2]) {
-        queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[BlitParams {
+    /// Update the opacity value in slot 0 (compatibility shim)
+    pub fn set_opacity(&self, queue: &wgpu::Queue, opacity: f32) {
+        self.set_opacity_at_slot(queue, opacity, 0);
+    }
+
+    /// Set UV transform parameters for scaling modes at a specific slot
+    pub fn set_uv_transform_at_slot(&self, queue: &wgpu::Queue, opacity: f32, uv_scale: [f32; 2], uv_offset: [f32; 2], slot_idx: usize) {
+        let offset = (slot_idx as u64 * self.slot_stride as u64) as wgpu::BufferAddress;
+        queue.write_buffer(&self.params_buffer, offset, bytemuck::cast_slice(&[BlitParams {
             opacity,
             rotation: 0,
             uv_scale,
@@ -201,9 +222,15 @@ impl BlitPipeline {
         }]));
     }
 
-    /// Set rotation for the final blit pass (0=0°, 1=90°, 2=180°, 3=270°).
-    pub fn set_rotation(&self, queue: &wgpu::Queue, rotation: u32) {
-        queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[BlitParams {
+    /// Set UV transform parameters in slot 0 (compatibility shim)
+    pub fn set_uv_transform(&self, queue: &wgpu::Queue, opacity: f32, uv_scale: [f32; 2], uv_offset: [f32; 2]) {
+        self.set_uv_transform_at_slot(queue, opacity, uv_scale, uv_offset, 0);
+    }
+
+    /// Set rotation for the final blit pass in a specific slot.
+    pub fn set_rotation_at_slot(&self, queue: &wgpu::Queue, rotation: u32, slot_idx: usize) {
+        let offset = (slot_idx as u64 * self.slot_stride as u64) as wgpu::BufferAddress;
+        queue.write_buffer(&self.params_buffer, offset, bytemuck::cast_slice(&[BlitParams {
             opacity: 1.0,
             rotation,
             uv_scale: [1.0, 1.0],
@@ -212,11 +239,22 @@ impl BlitPipeline {
         }]));
     }
 
-    /// Render a texture to a render pass
-    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, bind_group: &'a wgpu::BindGroup) {
+    /// Set rotation in slot 0 (compatibility shim)
+    pub fn set_rotation(&self, queue: &wgpu::Queue, rotation: u32) {
+        self.set_rotation_at_slot(queue, rotation, 0);
+    }
+
+    /// Render a texture to a render pass with a specific parameter slot (dynamic offset)
+    pub fn render_with_slot<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, bind_group: &'a wgpu::BindGroup, slot_idx: usize) {
+        let dynamic_offset = (slot_idx as u32 * self.slot_stride) as u32;
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, bind_group, &[]);
+        render_pass.set_bind_group(0, bind_group, &[dynamic_offset]);
         render_pass.draw(0..3, 0..1);
+    }
+
+    /// Render a texture using slot 0 (compatibility shim)
+    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, bind_group: &'a wgpu::BindGroup) {
+        self.render_with_slot(render_pass, bind_group, 0);
     }
 
     /// Render with specific opacity (updates buffer and renders)
@@ -290,11 +328,17 @@ pub struct CompositeBlitPipeline {
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     params_buffer: wgpu::Buffer,
+    /// Byte stride between parameter slots, aligned to device requirements.
+    slot_stride: u32,
 }
 
 impl CompositeBlitPipeline {
     /// Create a new composite blend pipeline.
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Result<Self> {
+        let alignment = device.limits().min_uniform_buffer_offset_alignment as usize;
+        let param_size = std::mem::size_of::<CompositeParams>();
+        let slot_stride = ((param_size + alignment - 1) / alignment * alignment) as u32;
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Composite Bind Group Layout"),
             entries: &[
@@ -327,30 +371,25 @@ impl CompositeBlitPipeline {
                     },
                     count: None,
                 },
-                // Params uniform buffer
+                // Params uniform buffer - with dynamic offset for batching
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(param_size as u64),
                     },
                     count: None,
                 },
             ],
         });
 
-        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Composite Params Buffer"),
-            contents: bytemuck::cast_slice(&[CompositeParams {
-                opacity: 1.0,
-                blend_mode: 0,
-                uv_scale: [1.0, 1.0],
-                uv_offset: [0.0, 0.0],
-                _pad: [0.0, 0.0],
-            }]),
+            size: (MAX_RENDER_SLOTS as u64 * slot_stride as u64),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -423,18 +462,25 @@ impl CompositeBlitPipeline {
             bind_group_layout,
             sampler,
             params_buffer,
+            slot_stride,
         })
     }
 
-    /// Update blend parameters.
-    pub fn set_params(&self, queue: &wgpu::Queue, opacity: f32, blend_mode: u32, uv_scale: [f32; 2], uv_offset: [f32; 2]) {
-        queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[CompositeParams {
+    /// Update blend parameters at a specific slot.
+    pub fn set_params_at_slot(&self, queue: &wgpu::Queue, opacity: f32, blend_mode: u32, uv_scale: [f32; 2], uv_offset: [f32; 2], slot_idx: usize) {
+        let offset = (slot_idx as u64 * self.slot_stride as u64) as wgpu::BufferAddress;
+        queue.write_buffer(&self.params_buffer, offset, bytemuck::cast_slice(&[CompositeParams {
             opacity,
             blend_mode,
             uv_scale,
             uv_offset,
             _pad: [0.0, 0.0],
         }]));
+    }
+
+    /// Update blend parameters in slot 0 (compatibility shim).
+    pub fn set_params(&self, queue: &wgpu::Queue, opacity: f32, blend_mode: u32, uv_scale: [f32; 2], uv_offset: [f32; 2]) {
+        self.set_params_at_slot(queue, opacity, blend_mode, uv_scale, uv_offset, 0);
     }
 
     /// Create a bind group for compositing source onto destination.
@@ -457,17 +503,27 @@ impl CompositeBlitPipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.params_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.params_buffer,
+                        offset: 0,
+                        size: Some(std::num::NonZeroU64::new(std::mem::size_of::<CompositeParams>() as u64).unwrap()),
+                    }),
                 },
             ],
         })
     }
 
-    /// Render: draw fullscreen quad with composite shader.
-    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, bind_group: &'a wgpu::BindGroup) {
+    /// Render: draw fullscreen quad with composite shader at a specific parameter slot.
+    pub fn render_with_slot<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, bind_group: &'a wgpu::BindGroup, slot_idx: usize) {
+        let dynamic_offset = (slot_idx as u32 * self.slot_stride) as u32;
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, bind_group, &[]);
+        render_pass.set_bind_group(0, bind_group, &[dynamic_offset]);
         render_pass.draw(0..3, 0..1);
+    }
+
+    /// Render: draw fullscreen quad using slot 0 (compatibility shim).
+    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, bind_group: &'a wgpu::BindGroup) {
+        self.render_with_slot(render_pass, bind_group, 0);
     }
 }
 

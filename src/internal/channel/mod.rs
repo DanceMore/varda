@@ -543,9 +543,12 @@ impl Channel {
         // from the mixer before render, so all channels stay in sync even when
         // faded out by the crossfader.
 
+        // We accumulate all command buffers for the entire frame to perform a
+        // single submission, reducing CPU-GPU sync overhead.
+        let mut frame_cmds: Vec<wgpu::CommandBuffer> = Vec::new();
+
         // Render each deck to its texture (skip muted, non-solo'd, zero-opacity)
         // Done decks still render — they serve as visible background for transitioning decks above.
-        let mut cmd_buffers: Vec<wgpu::CommandBuffer> = Vec::new();
         let mut active_count: u32 = 0;
         for (_deck_idx, slot) in self.decks.iter_mut().enumerate() {
             if !slot.mute && (!any_solo || slot.solo) && slot.opacity > 0.0 {
@@ -556,14 +559,10 @@ impl Channel {
                 // alternative is plumbing a separate borrow path. This clone
                 // happens once per visible deck per frame.
                 let param_prefix = slot.deck.mod_prefix.clone();
-                slot.deck.render_with_prefix(context, audio_data, modulation, &param_prefix, &mut cmd_buffers)?;
+                slot.deck.render_with_prefix(context, audio_data, modulation, &param_prefix, &mut frame_cmds)?;
             }
         }
         self.active_deck_count = active_count;
-        // Batch submit all deck renders at once
-        if !cmd_buffers.is_empty() {
-            context.queue.submit(cmd_buffers);
-        }
 
         // Collect render info for visible decks, including transition phase
         self.composite_info.clear();
@@ -616,7 +615,9 @@ impl Channel {
             if info.transition_progress.is_some() {
                 continue;
             }
-            self.render_composite_step(context, &info, composite_step, time, dt, width, height)?;
+            if let Some(cmd) = self.render_composite_step(context, &info, composite_step, time, dt, width, height)? {
+                frame_cmds.push(cmd);
+            }
             composite_step += 1;
         }
 
@@ -627,7 +628,9 @@ impl Channel {
             if info.transition_progress.is_none() {
                 continue;
             }
-            self.render_composite_step(context, &info, composite_step, time, dt, width, height)?;
+            if let Some(cmd) = self.render_composite_step(context, &info, composite_step, time, dt, width, height)? {
+                frame_cmds.push(cmd);
+            }
             composite_step += 1;
         }
 
@@ -653,7 +656,7 @@ impl Channel {
                     occlusion_query_set: None,
                 });
             }
-            context.queue.submit(std::iter::once(encoder.finish()));
+            frame_cmds.push(encoder.finish());
         }
 
         // Apply channel effect chain (if any)
@@ -677,8 +680,6 @@ impl Channel {
                 phase_times: [0.0; 4],
             };
 
-            let mut fx_cmd_buffers: Vec<wgpu::CommandBuffer> = Vec::new();
-
             for (_eff_idx, effect) in self.effects.iter_mut().enumerate() {
                 if !effect.enabled {
                     continue;
@@ -694,7 +695,7 @@ impl Channel {
                 // needed because effect is borrowed mutably below via
                 // apply_with_modulation.
                 let fx_prefix = effect.mod_prefix.clone();
-                if let Err(e) = effect.apply_with_modulation(context, input_view, output_view, &uniforms, Some(modulation), Some(&fx_prefix), &mut fx_cmd_buffers) {
+                if let Err(e) = effect.apply_with_modulation(context, input_view, output_view, &uniforms, Some(modulation), Some(&fx_prefix), &mut frame_cmds) {
                     log::warn!("Effect {} failed, skipping: {}", _eff_idx, e);
                     continue;
                 }
@@ -702,11 +703,10 @@ impl Channel {
             }
 
             // No final copy needed: result_view() always holds the latest content.
+        }
 
-            // Batch submit all channel effects
-            if !fx_cmd_buffers.is_empty() {
-                context.queue.submit(fx_cmd_buffers);
-            }
+        if !frame_cmds.is_empty() {
+            context.queue.submit(frame_cmds);
         }
 
         self.frame_count += 1;
@@ -719,6 +719,7 @@ impl Channel {
     }
 
     /// Render a single deck-compositing step onto the ping-pong target.
+    /// Returns the command buffer for this step instead of submitting it.
     fn render_composite_step(
         &mut self,
         context: &GpuContext,
@@ -728,7 +729,7 @@ impl Channel {
         dt: f32,
         width: u32,
         height: u32,
-    ) -> Result<()> {
+    ) -> Result<Option<wgpu::CommandBuffer>> {
         let slot = &mut self.decks[info.deck_idx];
 
         // Check if this deck is transitioning with a shader
@@ -760,16 +761,15 @@ impl Channel {
                     &uniforms,
                     effect.params.buffer(),
                 );
-                context.queue.submit(std::iter::once(cmd));
                 self.composite.advance();
-                return Ok(());
+                return Ok(Some(cmd));
             }
 
             // Opacity fade fallback (no shader or first deck)
             let fade_opacity = info.opacity * (1.0 - progress as f32);
             if step_idx == 0 {
                 // First deck: simple blit with alpha blending
-                self.blit_pipeline.set_opacity(&context.queue, fade_opacity);
+                self.blit_pipeline.set_opacity_at_slot(&context.queue, fade_opacity, step_idx);
                 let bind_group = self.blit_pipeline.create_bind_group(&context.device, &slot.deck.texture_view);
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Channel Composite Encoder (AT fade first)"),
@@ -790,13 +790,13 @@ impl Channel {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.blit_pipeline.render(&mut render_pass, &bind_group);
+                    self.blit_pipeline.render_with_slot(&mut render_pass, &bind_group, step_idx);
                 }
-                context.queue.submit(std::iter::once(encoder.finish()));
                 self.composite.advance();
+                return Ok(Some(encoder.finish()));
             } else {
                 // Subsequent decks: blend deck + background → target (no snapshot)
-                self.composite_pipeline.set_params(&context.queue, fade_opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
+                self.composite_pipeline.set_params_at_slot(&context.queue, fade_opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0], step_idx);
                 let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, self.composite.background_view());
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Channel Composite Encoder (AT fade)"),
@@ -817,18 +817,17 @@ impl Channel {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.composite_pipeline.render(&mut render_pass, &bind_group);
+                    self.composite_pipeline.render_with_slot(&mut render_pass, &bind_group, step_idx);
                 }
-                context.queue.submit(std::iter::once(encoder.finish()));
                 self.composite.advance();
+                return Ok(Some(encoder.finish()));
             }
-            return Ok(());
         }
 
         // Normal compositing
         if step_idx == 0 {
             // First deck: simple blit with alpha blending (Normal = just copy)
-            self.blit_pipeline.set_opacity(&context.queue, info.opacity);
+            self.blit_pipeline.set_opacity_at_slot(&context.queue, info.opacity, step_idx);
             let bind_group = self.blit_pipeline.create_bind_group(&context.device, &slot.deck.texture_view);
             let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Channel Composite Encoder (first)"),
@@ -849,13 +848,13 @@ impl Channel {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                self.blit_pipeline.render(&mut render_pass, &bind_group);
+                self.blit_pipeline.render_with_slot(&mut render_pass, &bind_group, step_idx);
             }
-            context.queue.submit(std::iter::once(encoder.finish()));
             self.composite.advance();
+            Ok(Some(encoder.finish()))
         } else {
             // Subsequent decks: blend src + background → target (no snapshot)
-            self.composite_pipeline.set_params(&context.queue, info.opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
+            self.composite_pipeline.set_params_at_slot(&context.queue, info.opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0], step_idx);
             let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, self.composite.background_view());
             let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Channel Composite Encoder"),
@@ -876,13 +875,11 @@ impl Channel {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                self.composite_pipeline.render(&mut render_pass, &bind_group);
+                self.composite_pipeline.render_with_slot(&mut render_pass, &bind_group, step_idx);
             }
-            context.queue.submit(std::iter::once(encoder.finish()));
             self.composite.advance();
+            Ok(Some(encoder.finish()))
         }
-
-        Ok(())
     }
 
     /// Resize the channel's textures
