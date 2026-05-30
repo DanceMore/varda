@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use super::{ModulationSource, ModulationSourceEntry, AudioValues, ParamModulation};
 
+/// A resolved modulation assignment that uses a direct index into the source value vector.
+/// Used to eliminate HashMap lookups in the render hot path.
+#[derive(Debug, Clone)]
+struct ResolvedAssignment {
+    source_idx: usize,
+    amount: f32,
+}
+
 /// Modulation engine manages sources and assignments for a deck
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModulationEngine {
@@ -28,6 +36,10 @@ pub struct ModulationEngine {
     cached_order: Vec<usize>,
     #[serde(skip)]
     cached_order_valid: bool,
+    /// Pre-resolved mod-on-mod assignments to eliminate per-frame format! and HashMap lookups.
+    /// Index matches `self.sources` index.
+    #[serde(skip)]
+    resolved_mod_on_mod: Vec<Vec<(String, Vec<ResolvedAssignment>)>>,
     /// Version counter incremented whenever sources or assignments mutate.
     /// Used by `ShaderParams` to cache "is modulated" status.
     #[serde(default)]
@@ -167,35 +179,80 @@ impl ModulationEngine {
     }
 
     fn source_idx(&self, uuid: &str) -> Option<usize> {
-        self.sources.iter().position(|e| e.uuid == uuid)
+        self.uuid_to_idx.get(uuid).copied()
     }
 
-    fn get_mod_source_offset(&self, source_uuid: &str, param_name: &str) -> f32 {
-        let key = format!("mod:{}:{}", source_uuid, param_name);
-        self.get_modulation(&key)
+    fn resolve_mod_on_mod_cache(&mut self) {
+        let n = self.sources.len();
+        self.resolved_mod_on_mod = vec![Vec::new(); n];
+
+        for i in 0..n {
+            let uuid = &self.sources[i].uuid;
+            let params = match &self.sources[i].source {
+                ModulationSource::LFO { .. } => &["frequency", "phase", "amplitude"][..],
+                ModulationSource::AudioBand { .. } => &["gain", "smoothing"][..],
+                ModulationSource::ADSR { .. } => &["attack", "decay", "sustain", "release"][..],
+                ModulationSource::StepSequencer { .. } => &["rate"][..],
+            };
+
+            for &param in params {
+                let key = format!("mod:{}:{}", uuid, param);
+                if let Some(mods) = self.assignments.get(&key) {
+                    let mut resolved = Vec::new();
+                    for m in mods {
+                        if let Some(&src_idx) = self.uuid_to_idx.get(&m.source_id) {
+                            resolved.push(ResolvedAssignment {
+                                source_idx: src_idx,
+                                amount: m.amount,
+                            });
+                        }
+                    }
+                    if !resolved.is_empty() {
+                        self.resolved_mod_on_mod[i].push((param.to_string(), resolved));
+                    }
+                }
+            }
+        }
     }
 
-    fn apply_mod_on_mod(&self, idx: usize, source: &ModulationSource) -> ModulationSource {
-        let uuid = &self.sources[idx].uuid;
+    fn apply_mod_on_mod_optimized(&self, idx: usize, source: &ModulationSource) -> ModulationSource {
+        let resolved_params = &self.resolved_mod_on_mod[idx];
+        if resolved_params.is_empty() {
+            return source.clone();
+        }
+
         let mut modified = source.clone();
-        match &mut modified {
-            ModulationSource::LFO { frequency, phase, amplitude, .. } => {
-                *frequency = (*frequency + self.get_mod_source_offset(uuid, "frequency")).max(0.001);
-                *phase = (*phase + self.get_mod_source_offset(uuid, "phase")).clamp(0.0, 1.0);
-                *amplitude = (*amplitude + self.get_mod_source_offset(uuid, "amplitude")).clamp(0.0, 1.0);
+        for (param_name, assignments) in resolved_params {
+            let mut offset = 0.0;
+            for m in assignments {
+                if let Some(val) = self.current_values.get(m.source_idx) {
+                    offset += val * m.amount;
+                }
             }
-            ModulationSource::AudioBand { gain, smoothing, .. } => {
-                *gain = (*gain + self.get_mod_source_offset(uuid, "gain")).max(0.0);
-                *smoothing = (*smoothing + self.get_mod_source_offset(uuid, "smoothing")).clamp(0.0, 0.99);
-            }
-            ModulationSource::ADSR { attack, decay, sustain, release, .. } => {
-                *attack = (*attack + self.get_mod_source_offset(uuid, "attack")).max(0.001);
-                *decay = (*decay + self.get_mod_source_offset(uuid, "decay")).max(0.001);
-                *sustain = (*sustain + self.get_mod_source_offset(uuid, "sustain")).clamp(0.0, 1.0);
-                *release = (*release + self.get_mod_source_offset(uuid, "release")).max(0.001);
-            }
-            ModulationSource::StepSequencer { rate, .. } => {
-                *rate = (*rate + self.get_mod_source_offset(uuid, "rate")).max(0.01);
+
+            match &mut modified {
+                ModulationSource::LFO { frequency, phase, amplitude, .. } => match param_name.as_str() {
+                    "frequency" => *frequency = (*frequency + offset).max(0.001),
+                    "phase" => *phase = (*phase + offset).clamp(0.0, 1.0),
+                    "amplitude" => *amplitude = (*amplitude + offset).clamp(0.0, 1.0),
+                    _ => {}
+                },
+                ModulationSource::AudioBand { gain, smoothing, .. } => match param_name.as_str() {
+                    "gain" => *gain = (*gain + offset).max(0.0),
+                    "smoothing" => *smoothing = (*smoothing + offset).clamp(0.0, 0.99),
+                    _ => {}
+                },
+                ModulationSource::ADSR { attack, decay, sustain, release, .. } => match param_name.as_str() {
+                    "attack" => *attack = (*attack + offset).max(0.001),
+                    "decay" => *decay = (*decay + offset).max(0.001),
+                    "sustain" => *sustain = (*sustain + offset).clamp(0.0, 1.0),
+                    "release" => *release = (*release + offset).max(0.001),
+                    _ => {}
+                },
+                ModulationSource::StepSequencer { rate, .. } => match param_name.as_str() {
+                    "rate" => *rate = (*rate + offset).max(0.01),
+                    _ => {}
+                },
             }
         }
         modified
@@ -213,9 +270,12 @@ impl ModulationEngine {
     /// `invalidate_evaluation_order()` after touching `sources` or
     /// `assignments`.
     pub(crate) fn evaluation_order(&mut self) -> Vec<usize> {
+        self.ensure_index();
         if self.cached_order_valid && self.cached_order.len() == self.sources.len() {
             return self.cached_order.clone();
         }
+
+        self.resolve_mod_on_mod_cache();
 
         const MAX_MOD_DEPTH: usize = 4;
         let n = self.sources.len();
@@ -279,19 +339,24 @@ impl ModulationEngine {
 
         let order = self.evaluation_order();
         for i in order {
-            let mut effective = self.apply_mod_on_mod(i, &self.sources[i].source);
-            let value = effective.calculate(time, dt, audio, self.prev_values[i]);
+            // Optimization: avoid cloning and applying mod-on-mod if no assignments exist for this source
+            let value = if self.resolved_mod_on_mod[i].is_empty() {
+                self.sources[i].source.calculate(time, dt, audio, self.prev_values[i])
+            } else {
+                let mut effective = self.apply_mod_on_mod_optimized(i, &self.sources[i].source);
+                let val = effective.calculate(time, dt, audio, self.prev_values[i]);
 
-            // Copy back mutable state changes (ADSR stage progression)
-            match (&mut self.sources[i].source, &effective) {
-                (ModulationSource::ADSR { stage, stage_time, current_level, .. },
-                 ModulationSource::ADSR { stage: eff_stage, stage_time: eff_st, current_level: eff_cl, .. }) => {
+                // Copy back mutable state changes (ADSR stage progression)
+                if let (ModulationSource::ADSR { stage, stage_time, current_level, .. },
+                        ModulationSource::ADSR { stage: eff_stage, stage_time: eff_st, current_level: eff_cl, .. }) =
+                    (&mut self.sources[i].source, &effective)
+                {
                     *stage = *eff_stage;
                     *stage_time = *eff_st;
                     *current_level = *eff_cl;
                 }
-                _ => {}
-            }
+                val
+            };
 
             self.current_values[i] = value;
             self.prev_values[i] = value;
@@ -309,17 +374,10 @@ impl ModulationEngine {
         let mut total = 0.0;
         for m in mods {
             if m.component == component {
-                let idx = if let Some(&i) = self.uuid_to_idx.get(&m.source_id) {
-                    i
-                } else {
-                    // Fallback: linear scan (handles deserialized state before ensure_index)
-                    match self.sources.iter().position(|e| e.uuid == m.source_id) {
-                        Some(i) => i,
-                        None => continue,
+                if let Some(&idx) = self.uuid_to_idx.get(&m.source_id) {
+                    if idx < self.current_values.len() {
+                        total += self.current_values[idx] * m.amount;
                     }
-                };
-                if idx < self.current_values.len() {
-                    total += self.current_values[idx] * m.amount;
                 }
             }
         }
@@ -339,8 +397,8 @@ impl ModulationEngine {
 
     /// Get current value for a source by UUID
     pub fn current_value_for(&self, uuid: &str) -> f32 {
-        self.sources.iter().position(|e| e.uuid == uuid)
-            .and_then(|idx| self.current_values.get(idx).copied())
+        self.uuid_to_idx.get(uuid)
+            .and_then(|&idx| self.current_values.get(idx).copied())
             .unwrap_or(0.0)
     }
 
