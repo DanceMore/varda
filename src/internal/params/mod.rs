@@ -181,9 +181,9 @@ pub struct ShaderParams {
     /// Whether the cached keys are valid for the current prefix.
     #[serde(skip)]
     cached_keys_valid: bool,
-    /// Per-parameter modulation status cache
+    /// Indices of parameters that have active modulations
     #[serde(skip)]
-    is_modulated: Vec<bool>,
+    modulated_indices: Vec<usize>,
     /// The `ModulationEngine` version when `is_modulated` was last updated
     #[serde(skip)]
     last_mod_version: u64,
@@ -226,7 +226,7 @@ impl ShaderParams {
             }
         }
 
-        let is_modulated = vec![false; values.len()];
+        let modulated_indices = Vec::new();
         let mut render_info = vec![ParamRenderInfo::default(); values.len()];
         let resolved_mods = vec![Vec::new(); values.len()];
 
@@ -253,7 +253,7 @@ impl ShaderParams {
             cached_mod_keys: Vec::new(),
             last_mod_prefix: None,
             cached_keys_valid: false,
-            is_modulated,
+            modulated_indices,
             last_mod_version: 0,
             render_info,
             resolved_mods,
@@ -509,9 +509,8 @@ impl ShaderParams {
     /// This handles the case where the struct was deserialized (skipping these fields).
     fn ensure_caches(&mut self) {
         let n = self.values.len();
-        if self.is_modulated.len() != n {
-            self.is_modulated = vec![false; n];
-        }
+        // modulated_indices is cleared and rebuilt when last_mod_version changes,
+        // so we don't need to size it here.
         if self.resolved_mods.len() != n {
             self.resolved_mods = vec![Vec::new(); n];
         }
@@ -585,20 +584,26 @@ impl ShaderParams {
         // We resolve all active modulations to direct source indices to eliminate
         // HashMap lookups and O(N) searches in the hot loop.
         if self.last_mod_version != modulation.version || prefix_changed {
+            self.modulated_indices.clear();
             for (i, _name) in self.param_order.iter().enumerate() {
                 let mod_key = &self.cached_mod_keys[i];
-                self.is_modulated[i] = modulation.has_modulation(mod_key);
+                let has_mod = modulation.has_modulation(mod_key);
 
                 self.resolved_mods[i].clear();
-                if let Some(assignments) = modulation.assignments.get(mod_key) {
-                    for m in assignments {
-                        if let Some(src_idx) = modulation.source_idx(&m.source_id) {
-                            self.resolved_mods[i].push(ResolvedMod {
-                                source_idx: src_idx,
-                                amount: m.amount,
-                                component: m.component,
-                            });
+                if has_mod {
+                    if let Some(assignments) = modulation.assignments.get(mod_key) {
+                        for m in assignments {
+                            if let Some(src_idx) = modulation.source_idx(&m.source_id) {
+                                self.resolved_mods[i].push(ResolvedMod {
+                                    source_idx: src_idx,
+                                    amount: m.amount,
+                                    component: m.component,
+                                });
+                            }
                         }
+                    }
+                    if !self.resolved_mods[i].is_empty() {
+                        self.modulated_indices.push(i);
                     }
                 }
             }
@@ -606,8 +611,7 @@ impl ShaderParams {
         }
 
         // Fast path: if no parameters are modulated, return base_data directly.
-        let any_modulated = self.is_modulated.iter().any(|&m| m);
-        if !any_modulated {
+        if self.modulated_indices.is_empty() {
             return &self.base_data;
         }
 
@@ -617,12 +621,15 @@ impl ShaderParams {
 
         let mod_values = modulation.current_values();
 
-        for i in 0..self.values.len() {
-            if self.is_modulated[i] {
-                let modulated = self.apply_resolved_modulation(i, &self.values[i], mod_values);
-                let offset = self.param_offsets[i];
-                modulated.write_to_buffer(&mut self.data_cache[offset..]);
-            }
+        for &i in &self.modulated_indices {
+            let modulated = self.apply_resolved_modulation(
+                &self.values[i],
+                &self.resolved_mods[i],
+                &self.render_info[i],
+                mod_values,
+            );
+            let offset = self.param_offsets[i];
+            modulated.write_to_buffer(&mut self.data_cache[offset..]);
         }
 
         &self.data_cache
@@ -631,11 +638,11 @@ impl ShaderParams {
     /// Apply pre-resolved modulation to a parameter value using direct source indexing.
     fn apply_resolved_modulation(
         &self,
-        idx: usize,
         value: &ParamValue,
+        resolved: &[ResolvedMod],
+        info: &ParamRenderInfo,
         mod_values: &[f32],
     ) -> ParamValue {
-        let resolved = &self.resolved_mods[idx];
         if resolved.is_empty() {
             return *value;
         }
@@ -653,7 +660,6 @@ impl ShaderParams {
                     return *value;
                 }
 
-                let info = &self.render_info[idx];
                 let modulated = (base + offset * info.range).clamp(info.min, info.max);
                 ParamValue::Float(modulated)
             }
