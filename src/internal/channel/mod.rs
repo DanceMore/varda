@@ -375,15 +375,12 @@ pub struct Channel {
     pub active_deck_count: u32,
 
     /// Sorted indices of decks in this channel, reused every frame to avoid heap allocations.
-    #[serde(skip)]
     deck_indices: Vec<usize>,
 
     /// Cached metadata for deck compositing, reused every frame.
-    #[serde(skip)]
     composite_info: Vec<DeckCompositeInfo>,
 
     /// Decks that just started transitioning in `tick_auto_transitions`, reused every frame.
-    #[serde(skip)]
     just_started_transitioning: Vec<usize>,
 }
 
@@ -402,6 +399,12 @@ impl Channel {
     /// Composited output view (all decks blended, post effect-chain) — always current.
     pub fn composite_view(&self) -> &wgpu::TextureView {
         self.composite.result_view()
+    }
+
+    /// Non-sRGB reinterpret view of the channel composite, for egui previews.
+    /// See `PingPong::result_view_linear`.
+    pub fn composite_view_linear(&self) -> &wgpu::TextureView {
+        self.composite.result_view_linear()
     }
 
     /// Composited output texture (all decks blended, post effect-chain) — always current.

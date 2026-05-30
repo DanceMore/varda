@@ -124,6 +124,8 @@ pub struct DomePreviewRenderer {
     /// Output render target.
     pub output_texture: wgpu::Texture,
     pub output_view: wgpu::TextureView,
+    /// Non-sRGB reinterpret view of `output_texture` for the egui dome preview.
+    pub output_view_linear: wgpu::TextureView,
     /// Depth buffer — kept alive so `depth_view` remains valid.
     #[allow(dead_code)]
     depth_texture: wgpu::Texture,
@@ -306,10 +308,14 @@ impl DomePreviewRenderer {
 
         let (output_texture, output_view, depth_texture, depth_view) =
             Self::create_textures(device, format, width, height);
+        let output_view_linear = output_texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(format.remove_srgb_suffix()),
+            ..Default::default()
+        });
 
         Ok(Self {
             pipeline, bind_group_layout, vertex_buffer, index_buffer, num_indices,
-            uniform_buffer, sampler, output_texture, output_view, depth_texture, depth_view,
+            uniform_buffer, sampler, output_texture, output_view, output_view_linear, depth_texture, depth_view,
             camera: OrbitCamera::default(),
             width, height, format,
             overlay_pipeline, overlay_bgl, overlay_vertex_buffer, overlay_num_vertices: 0,
@@ -323,12 +329,18 @@ impl DomePreviewRenderer {
         width: u32,
         height: u32,
     ) -> (wgpu::Texture, wgpu::TextureView, wgpu::Texture, wgpu::TextureView) {
-        let create_tex = |label, fmt, usage| {
+        let create_tex = |label, fmt: wgpu::TextureFormat, usage| {
+            // Allow a non-sRGB reinterpret view for the egui preview (no-op for the
+            // depth target, whose format has no sRGB variant).
+            let linear = fmt.remove_srgb_suffix();
+            let view_formats = [linear];
+            let view_formats: &[wgpu::TextureFormat] =
+                if linear != fmt { &view_formats } else { &[] };
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
                 mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-                format: fmt, usage, view_formats: &[],
+                format: fmt, usage, view_formats,
             });
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
             (tex, view)
@@ -352,6 +364,10 @@ impl DomePreviewRenderer {
             return false;
         }
         let (ot, ov, dt, dv) = Self::create_textures(device, self.format, w, h);
+        self.output_view_linear = ot.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.format.remove_srgb_suffix()),
+            ..Default::default()
+        });
         self.output_texture = ot;
         self.output_view = ov;
         self.depth_texture = dt;

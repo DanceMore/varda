@@ -158,6 +158,7 @@ impl ParamValue {
 }
 
 /// Shader parameters - stores current values and GPU buffer
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShaderParams {
     /// Parameter names in order (for consistent buffer layout)
     pub param_order: Vec<String>,
@@ -169,6 +170,7 @@ pub struct ShaderParams {
     /// ISF input definitions (for UI metadata: min/max/label)
     pub definitions: HashMap<String, ISFInput>,
     /// GPU buffer (created on demand)
+    #[serde(skip)]
     buffer: Option<wgpu::Buffer>,
     /// Buffer needs re-upload
     dirty: bool,

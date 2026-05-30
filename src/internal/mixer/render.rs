@@ -350,14 +350,18 @@ impl Mixer {
 
     /// Composite a specific subset of channels into the cached sub-mix texture.
     fn composite_sub_mix(&mut self, indices: &[usize], context: &GpuContext) {
-        let (_sub_tex, sub_view, _scratch_tex, scratch_view) = match self.sub_mix_cache.get(indices) {
-            Some(entry) => entry,
-            None => return,
-        };
+        if !self.sub_mix_cache.contains_key(indices) {
+            return;
+        }
 
         // Same linear-crossfade formula as composite_channels — share the helper
         // so sub-mixes get the corrected opacity-compensation math.
         self.update_composite_opacities();
+
+        let (_sub_tex, sub_view, _scratch_tex, scratch_view) = match self.sub_mix_cache.get(indices) {
+            Some(entry) => entry,
+            None => return,
+        };
 
         // Collect visible channels in this sub-mix.
         self.sub_mix_visible.clear();

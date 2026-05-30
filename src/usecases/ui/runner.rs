@@ -433,7 +433,7 @@ impl UIRunner {
             ) {
                 Ok(renderer) => {
                     let tid = egui_renderer.register_native_texture(
-                        &context.device, &renderer.output_view, wgpu::FilterMode::Linear,
+                        &context.device, &renderer.output_view_linear, wgpu::FilterMode::Linear,
                     );
                     self.dome_preview_texture = Some(tid);
                     self.dome_preview_renderer = Some(renderer);
@@ -478,6 +478,39 @@ impl UIRunner {
         }
     }
 
+    /// Non-sRGB reinterpret view for an output preview registered with egui.
+    /// Mirrors `output_preview_view` but hands egui linear views so the thumbnail
+    /// gamma matches the real output (see `PingPong::result_view_linear`). Deck
+    /// sources are already `Rgba8Unorm`; sub-mix results have no linear view cached,
+    /// so they keep a slight gamma offset — content correctness wins there.
+    fn output_preview_view_linear<'a>(
+        output: &'a crate::renderer::context::UnifiedOutput,
+        mixer: &'a crate::mixer::Mixer,
+    ) -> &'a wgpu::TextureView {
+        use crate::renderer::context::{UnifiedOutput, OutputSource};
+        match output {
+            UnifiedOutput::Window(w) => &w.preview_texture_view_linear,
+            UnifiedOutput::Headless(h) => match &h.source {
+                OutputSource::Master => mixer.composite_view_linear(),
+                OutputSource::Channel(idx) => mixer.channels().get(*idx)
+                    .map(|c| c.composite_view_linear())
+                    .unwrap_or_else(|| mixer.composite_view_linear()),
+                OutputSource::Deck(ch, dk) => mixer.channels().get(*ch)
+                    .and_then(|c| c.decks.get(*dk))
+                    .map(|s| &s.deck.texture_view)
+                    .unwrap_or_else(|| mixer.composite_view_linear()),
+                OutputSource::Channels(indices) => {
+                    let mut sorted = indices.clone();
+                    sorted.sort();
+                    sorted.dedup();
+                    mixer.get_sub_mix_view(&sorted)
+                        .unwrap_or_else(|| mixer.composite_view_linear())
+                }
+                OutputSource::Domemaster => mixer.composite_view_linear(),
+            },
+        }
+    }
+
     /// Re-register GPU textures when deck/channel/output layout changes.
     fn refresh_textures(&mut self) {
         let Some(varda) = &self.varda else { return };
@@ -515,6 +548,46 @@ impl UIRunner {
                     &context.device, view, wgpu::FilterMode::Linear,
                 );
                 self.output_preview_textures.insert(out_idx, tid);
+            }
+        }
+    }
+
+    /// Re-point composite-backed preview TextureIds at their live views.
+    ///
+    /// The mixer and channel composites are PingPong targets: `composite_view()`
+    /// returns whichever of the two textures currently holds the result, and that
+    /// physical texture alternates with the per-frame `advance()` parity. egui bakes
+    /// the view into a bind group at registration time, so a once-registered
+    /// TextureId pins to one texture and samples the stale scratch buffer on
+    /// parity-flipped frames. Output windows dodge this by re-resolving
+    /// `composite_view()` every frame; the previews need the same treatment. Call
+    /// after `render_mixer_frame()` (parity settled) and before egui samples them.
+    fn sync_dynamic_previews(&mut self) {
+        let Some(varda) = &self.varda else { return };
+        let Some(egui_renderer) = &mut self.egui_renderer else { return };
+        let context = varda.gpu_context();
+        let mixer = varda.mixer_ref();
+
+        // Register the *linear* reinterpret views: egui does its own gamma, so an
+        // sRGB view would double-darken the preview versus the real output.
+        for (ch_idx, ch) in mixer.channels().iter().enumerate() {
+            if let Some(&ch_tid) = self.channel_preview_textures.get(&ch_idx) {
+                egui_renderer.update_egui_texture_from_wgpu_texture(
+                    &context.device, ch.composite_view_linear(), wgpu::FilterMode::Linear, ch_tid,
+                );
+            }
+        }
+        if let Some(main_id) = self.main_output_texture {
+            egui_renderer.update_egui_texture_from_wgpu_texture(
+                &context.device, mixer.composite_view_linear(), wgpu::FilterMode::Linear, main_id,
+            );
+        }
+        for (out_idx, output) in varda.outputs_ref().iter().enumerate() {
+            if let Some(&tid) = self.output_preview_textures.get(&out_idx) {
+                let view = Self::output_preview_view_linear(output, mixer);
+                egui_renderer.update_egui_texture_from_wgpu_texture(
+                    &context.device, view, wgpu::FilterMode::Linear, tid,
+                );
             }
         }
     }
@@ -1072,6 +1145,7 @@ impl UIRunner {
             let Some(varda) = self.varda.as_mut() else { return; };
             varda.render_mixer_frame();
         }
+        self.sync_dynamic_previews();
         self.submit_frame(window, full_output.shapes, full_output.pixels_per_point, full_output.textures_delta);
 
         // 8. Render output windows + publish state

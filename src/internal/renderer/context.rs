@@ -167,6 +167,15 @@ impl GpuContext {
 
     /// Create a texture for rendering
     pub fn create_render_texture(&self, width: u32, height: u32) -> wgpu::Texture {
+        // Allow a non-sRGB reinterpret view. The compositing pipelines render
+        // through the sRGB format, but egui samples these textures for previews
+        // expecting raw (non-sRGB-aware) bytes — it does its own gamma handling.
+        // Without a linear view, the hardware sRGB decode on sample double-darkens
+        // the preview relative to the real output. See PingPong::result_view_linear.
+        let linear = self.texture_format.remove_srgb_suffix();
+        let view_formats = [linear];
+        let view_formats: &[wgpu::TextureFormat] =
+            if linear != self.texture_format { &view_formats } else { &[] };
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Texture"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -178,7 +187,7 @@ impl GpuContext {
                  | wgpu::TextureUsages::TEXTURE_BINDING
                  | wgpu::TextureUsages::COPY_SRC
                  | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+            view_formats,
         })
     }
 
@@ -431,6 +440,9 @@ pub struct OutputWindow {
     /// When edge blend is on, edge blend shader writes here from surface_texture.
     pub preview_texture: wgpu::Texture,
     pub preview_texture_view: wgpu::TextureView,
+    /// Non-sRGB reinterpret view of `preview_texture` for the egui output preview.
+    /// egui does its own gamma; sampling the sRGB view double-darkens the thumbnail.
+    pub preview_texture_view_linear: wgpu::TextureView,
     /// Per-output rotation applied at the final blit stage.
     pub rotation: OutputRotation,
 }
@@ -483,6 +495,7 @@ impl OutputWindow {
         let edge_blend_pipeline = super::edge_blend::EdgeBlendPipeline::new(&context.device, surface_config.format)?;
         let (surface_texture, surface_texture_view) = Self::create_intermediate_texture(&context.device, size.width, size.height, surface_config.format, "Surface Intermediate");
         let (preview_texture, preview_texture_view) = Self::create_intermediate_texture(&context.device, size.width, size.height, surface_config.format, "Preview");
+        let preview_texture_view_linear = Self::linear_view(&preview_texture);
 
         Ok(Self {
             uuid: crate::deck::generate_short_uuid(),
@@ -503,12 +516,19 @@ impl OutputWindow {
             surface_texture_view,
             preview_texture,
             preview_texture_view,
+            preview_texture_view_linear,
             rotation: OutputRotation::default(),
         })
     }
 
     /// Create an intermediate GPU texture for the render pipeline.
+    /// Allows a non-sRGB reinterpret view (for egui previews — see
+    /// `OutputWindow::preview_texture_view_linear`).
     fn create_intermediate_texture(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat, label: &str) -> (wgpu::Texture, wgpu::TextureView) {
+        let linear = format.remove_srgb_suffix();
+        let view_formats = [linear];
+        let view_formats: &[wgpu::TextureFormat] =
+            if linear != format { &view_formats } else { &[] };
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
@@ -517,10 +537,19 @@ impl OutputWindow {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+            view_formats,
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         (tex, view)
+    }
+
+    /// A non-sRGB reinterpret view of an intermediate texture (identity for
+    /// already-linear formats). The texture must allow it via `view_formats`.
+    fn linear_view(tex: &wgpu::Texture) -> wgpu::TextureView {
+        tex.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(tex.format().remove_srgb_suffix()),
+            ..Default::default()
+        })
     }
 
     /// Resize this output window's surface
@@ -536,6 +565,7 @@ impl OutputWindow {
             self.surface_texture = tex;
             self.surface_texture_view = view;
             let (tex, view) = Self::create_intermediate_texture(device, ew, eh, fmt, "Preview");
+            self.preview_texture_view_linear = Self::linear_view(&tex);
             self.preview_texture = tex;
             self.preview_texture_view = view;
         }
@@ -550,6 +580,7 @@ impl OutputWindow {
         self.surface_texture = tex;
         self.surface_texture_view = view;
         let (tex, view) = Self::create_intermediate_texture(device, ew, eh, fmt, "Preview");
+        self.preview_texture_view_linear = Self::linear_view(&tex);
         self.preview_texture = tex;
         self.preview_texture_view = view;
     }

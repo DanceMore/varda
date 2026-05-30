@@ -86,15 +86,12 @@ pub struct Mixer {
     pub(super) prev_culled: Vec<bool>,
 
     /// Effective opacities for each channel, reused every frame to avoid heap allocations.
-    #[serde(skip)]
     pub(super) effective_opacities: Vec<f32>,
 
     /// Corrected opacities for composite passes, reused every frame.
-    #[serde(skip)]
     pub(super) composite_opacities: Vec<f32>,
 
     /// Channels visible in the current sub-mix being composited.
-    #[serde(skip)]
     pub(super) sub_mix_visible: Vec<SubMixInfo>,
 }
 
@@ -317,6 +314,12 @@ impl Mixer {
     /// The composited output texture view (post-crossfade, post-master-effects).
     pub fn composite_view(&self) -> &wgpu::TextureView {
         self.composite.result_view()
+    }
+
+    /// Non-sRGB reinterpret view of the composite, for egui previews. See
+    /// `PingPong::result_view_linear`.
+    pub fn composite_view_linear(&self) -> &wgpu::TextureView {
+        self.composite.result_view_linear()
     }
 
     // ── UUID lookup helpers ────────────────────────────────────────────
