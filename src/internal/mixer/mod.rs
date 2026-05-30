@@ -14,6 +14,14 @@ use crate::deck::Effect;
 use crate::modulation::ModulationEngine;
 use crate::renderer::{GpuContext, BlitPipeline, CompositeBlitPipeline, PingPong};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+/// Metadata for sub-mix compositing, cached to avoid per-frame allocations.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SubMixInfo {
+    pub ch_idx: usize,
+    pub opacity: f32,
+}
 
 /// Mixer - Top-level compositor
 pub struct Mixer {
@@ -77,6 +85,17 @@ pub struct Mixer {
     /// avoiding a per-frame clear submission for every culled channel.
     pub(super) prev_culled: Vec<bool>,
 
+    /// Effective opacities for each channel, reused every frame to avoid heap allocations.
+    #[serde(skip)]
+    pub(super) effective_opacities: Vec<f32>,
+
+    /// Corrected opacities for composite passes, reused every frame.
+    #[serde(skip)]
+    pub(super) composite_opacities: Vec<f32>,
+
+    /// Channels visible in the current sub-mix being composited.
+    #[serde(skip)]
+    pub(super) sub_mix_visible: Vec<SubMixInfo>,
 }
 
 impl Mixer {
@@ -114,6 +133,9 @@ impl Mixer {
             transition_sequences: Vec::new(),
             sub_mix_cache: std::collections::HashMap::new(),
             prev_culled: vec![false, false],
+            effective_opacities: Vec::new(),
+            composite_opacities: Vec::new(),
+            sub_mix_visible: Vec::new(),
         })
     }
 
@@ -329,6 +351,9 @@ impl Mixer {
         self.next_channel_index = max_idx;
         self.channels = channels;
         self.prev_culled = vec![false; self.channels.len()];
+        self.effective_opacities.clear();
+        self.composite_opacities.clear();
+        self.sub_mix_visible.clear();
     }
 
     /// Set the crossfader position directly (used by persistence restore).
