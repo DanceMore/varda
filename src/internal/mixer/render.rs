@@ -244,14 +244,22 @@ impl Mixer {
         //
         // Submit per-channel to ensure each channel's uniform buffer writes
         // are consumed before the next channel overwrites them.
+        // Composite channels via ping-pong: the first visible channel blits into
+        // the target; each subsequent channel blends over the composite-so-far
+        // (background_view) into the fresh target, then advance(). No snapshot copy.
+        //
+        // We use dynamic offsets and a single CommandEncoder to batch all
+        // compositing steps into a single GPU submission, eliminating CPU overhead.
         let mut is_first = true;
+        let mut composite_cmds = Vec::new();
+
         for i in 0..self.channels.len() {
             let opacity = self.composite_opacities[i];
             if opacity <= 0.0 { continue; }
 
             if is_first {
                 // First visible channel: simple blit copy into the ping-pong target
-                self.blit_pipeline.set_opacity(&context.queue, opacity);
+                self.blit_pipeline.set_opacity_at_slot(&context.queue, opacity, i);
                 let bind_group = self.blit_pipeline.create_bind_group(&context.device, self.channels[i].composite_view());
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Mixer Composite Encoder (first)"),
@@ -272,15 +280,15 @@ impl Mixer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.blit_pipeline.render(&mut render_pass, &bind_group);
+                    self.blit_pipeline.render_with_slot(&mut render_pass, &bind_group, i);
                 }
-                context.queue.submit(std::iter::once(encoder.finish()));
+                composite_cmds.push(encoder.finish());
                 self.composite.advance();
                 is_first = false;
             } else {
                 // Subsequent channels: blend channel + background → target (no snapshot)
                 let blend_mode = self.channels[i].blend_mode;
-                self.composite_pipeline.set_params(&context.queue, opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
+                self.composite_pipeline.set_params_at_slot(&context.queue, opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0], i);
                 let bind_group = self.composite_pipeline.create_bind_group(
                     &context.device,
                     self.channels[i].composite_view(),
@@ -305,11 +313,15 @@ impl Mixer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.composite_pipeline.render(&mut render_pass, &bind_group);
+                    self.composite_pipeline.render_with_slot(&mut render_pass, &bind_group, i);
                 }
-                context.queue.submit(std::iter::once(encoder.finish()));
+                composite_cmds.push(encoder.finish());
                 self.composite.advance();
             }
+        }
+
+        if !composite_cmds.is_empty() {
+            context.queue.submit(composite_cmds);
         }
 
         Ok(())
@@ -386,23 +398,22 @@ impl Mixer {
         // the target for each step based on the total count, we ensure the final
         // result always lands in `sub_view` without any intermediate full-screen
         // GPU snapshot copies.
+        //
+        // We use dynamic offsets and a single queue submission to batch the sub-mix stack.
         let n = self.sub_mix_visible.len();
+        let mut sub_mix_cmds = Vec::with_capacity(n);
+
         for i in 0..n {
             let info = self.sub_mix_visible[i];
             let channel = &self.channels[info.ch_idx];
 
             // Parity: we want the final step (i = n-1) to land in sub_view.
-            // step i writes to T_i, reads from T_{i-1}.
-            // T_{n-1} = sub_view.
-            // T_{n-2} = scratch_view.
-            // T_{n-3} = sub_view.
-            // Target for step i is sub_view if (n - 1 - i) is even.
             let target = if (n - 1 - i) % 2 == 0 { sub_view } else { scratch_view };
             let background = if (n - 1 - i) % 2 == 0 { scratch_view } else { sub_view };
 
             if i == 0 {
                 // First visible channel: simple blit copy into the selected target
-                self.blit_pipeline.set_opacity(&context.queue, info.opacity);
+                self.blit_pipeline.set_opacity_at_slot(&context.queue, info.opacity, i);
                 let bind_group = self.blit_pipeline.create_bind_group(&context.device, channel.composite_view());
                 let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Sub-mix Composite Encoder (first)"),
@@ -423,13 +434,13 @@ impl Mixer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.blit_pipeline.render(&mut render_pass, &bind_group);
+                    self.blit_pipeline.render_with_slot(&mut render_pass, &bind_group, i);
                 }
-                context.queue.submit(std::iter::once(encoder.finish()));
+                sub_mix_cmds.push(encoder.finish());
             } else {
                 // Subsequent channels: blend channel + background → target (no snapshot)
                 let blend_mode = channel.blend_mode;
-                self.composite_pipeline.set_params(&context.queue, info.opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
+                self.composite_pipeline.set_params_at_slot(&context.queue, info.opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0], i);
                 let bind_group = self.composite_pipeline.create_bind_group(
                     &context.device,
                     channel.composite_view(),
@@ -454,10 +465,13 @@ impl Mixer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.composite_pipeline.render(&mut render_pass, &bind_group);
+                    self.composite_pipeline.render_with_slot(&mut render_pass, &bind_group, i);
                 }
-                context.queue.submit(std::iter::once(encoder.finish()));
+                sub_mix_cmds.push(encoder.finish());
             }
+        }
+        if !sub_mix_cmds.is_empty() {
+            context.queue.submit(sub_mix_cmds);
         }
     }
 
