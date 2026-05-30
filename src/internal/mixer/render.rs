@@ -72,13 +72,12 @@ impl Mixer {
 
         // Compute effective opacity per channel
         let channel_count = self.channels.len();
-        let effective_opacities: Vec<f32> = if channel_count == 2 {
-            vec![
-                (1.0 - self.crossfader) * self.channels[0].opacity,
-                self.crossfader * self.channels[1].opacity,
-            ]
+        self.effective_opacities.clear();
+        if channel_count == 2 {
+            self.effective_opacities.push((1.0 - self.crossfader) * self.channels[0].opacity);
+            self.effective_opacities.push(self.crossfader * self.channels[1].opacity);
         } else {
-            self.channels.iter().map(|ch| ch.opacity).collect()
+            self.effective_opacities.extend(self.channels.iter().map(|ch| ch.opacity));
         };
 
         // Always tick video frames on every channel so players stay in sync
@@ -96,7 +95,7 @@ impl Mixer {
 
         let mut clear_cmds = Vec::new();
         for (ch_idx, channel) in self.channels.iter_mut().enumerate() {
-            let is_culled = effective_opacities.get(ch_idx).copied().unwrap_or(0.0) < 0.001;
+            let is_culled = self.effective_opacities.get(ch_idx).copied().unwrap_or(0.0) < 0.001;
             let was_culled = self.prev_culled[ch_idx];
             if is_culled {
                 // Reset stats so culled channels don't show stale render metrics
@@ -140,7 +139,8 @@ impl Mixer {
     /// by (1 - b), the final result is still the requested linear mix:
     ///     ((1-cf)·opacityA)·A + (cf·opacityB)·B.
     /// For >2 channels each channel just contributes its own opacity.
-    fn composite_pass_opacities(&self) -> Vec<f32> {
+    fn update_composite_opacities(&mut self) {
+        self.composite_opacities.clear();
         if self.channels.len() == 2 {
             let b_weight = (self.crossfader * self.channels[1].opacity).clamp(0.0, 1.0);
             let a_weight = ((1.0 - self.crossfader) * self.channels[0].opacity).clamp(0.0, 1.0);
@@ -149,9 +149,10 @@ impl Mixer {
             } else {
                 0.0
             };
-            vec![a_copy_opacity, b_weight]
+            self.composite_opacities.push(a_copy_opacity);
+            self.composite_opacities.push(b_weight);
         } else {
-            self.channels.iter().map(|ch| ch.opacity).collect()
+            self.composite_opacities.extend(self.channels.iter().map(|ch| ch.opacity));
         }
     }
 
@@ -229,7 +230,7 @@ impl Mixer {
         // after the second pass attenuates the destination by (1 - b), the final
         // result is still the requested linear mix:
         //     ((1-cf)·opacityA)·A + (cf·opacityB)·B.
-        let opacities: Vec<f32> = self.composite_pass_opacities();
+        self.update_composite_opacities();
 
         // Composite channels via ping-pong: the first visible channel blits into
         // the target; each subsequent channel blends over the composite-so-far
@@ -245,7 +246,7 @@ impl Mixer {
         // are consumed before the next channel overwrites them.
         let mut is_first = true;
         for i in 0..self.channels.len() {
-            let opacity = opacities[i];
+            let opacity = self.composite_opacities[i];
             if opacity <= 0.0 { continue; }
 
             if is_first {
@@ -336,7 +337,7 @@ impl Mixer {
     }
 
     /// Composite a specific subset of channels into the cached sub-mix texture.
-    fn composite_sub_mix(&self, indices: &[usize], context: &GpuContext) {
+    fn composite_sub_mix(&mut self, indices: &[usize], context: &GpuContext) {
         let (_sub_tex, sub_view, _scratch_tex, scratch_view) = match self.sub_mix_cache.get(indices) {
             Some(entry) => entry,
             None => return,
@@ -344,23 +345,18 @@ impl Mixer {
 
         // Same linear-crossfade formula as composite_channels — share the helper
         // so sub-mixes get the corrected opacity-compensation math.
-        let opacities: Vec<f32> = self.composite_pass_opacities();
+        self.update_composite_opacities();
 
         // Collect visible channels in this sub-mix.
-        struct SubMixInfo {
-            ch_idx: usize,
-            opacity: f32,
+        self.sub_mix_visible.clear();
+        for &ch_idx in indices {
+            if ch_idx >= self.channels.len() { continue; }
+            let opacity = self.composite_opacities[ch_idx];
+            if opacity <= 0.0 { continue; }
+            self.sub_mix_visible.push(super::SubMixInfo { ch_idx, opacity });
         }
-        let visible: Vec<SubMixInfo> = indices.iter()
-            .filter_map(|&ch_idx| {
-                if ch_idx >= self.channels.len() { return None; }
-                let opacity = opacities.get(ch_idx).copied().unwrap_or(0.0);
-                if opacity <= 0.0 { return None; }
-                Some(SubMixInfo { ch_idx, opacity })
-            })
-            .collect();
 
-        if visible.is_empty() {
+        if self.sub_mix_visible.is_empty() {
             let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Sub-mix Clear Encoder"),
             });
@@ -390,8 +386,9 @@ impl Mixer {
         // the target for each step based on the total count, we ensure the final
         // result always lands in `sub_view` without any intermediate full-screen
         // GPU snapshot copies.
-        let n = visible.len();
-        for (i, info) in visible.iter().enumerate() {
+        let n = self.sub_mix_visible.len();
+        for i in 0..n {
+            let info = self.sub_mix_visible[i];
             let channel = &self.channels[info.ch_idx];
 
             // Parity: we want the final step (i = n-1) to land in sub_view.
