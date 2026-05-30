@@ -35,9 +35,26 @@ const HEIGHT: u32 = 1080;
 const FRAME_BUDGET_US: u128 = 16_670;
 
 const BARS_SHADER: &str = include_str!("../shaders/bars.fs");
+// A real, heavy gig generator (raymarched), not a synthetic worst case — so the
+// crossfade split below measures fill the way an actual set would produce it.
+const HEAVY_SHADERS: &[(&str, &str)] = &[
+    ("sacred_geometry", include_str!("../shaders/sacred_geometry.fs")),
+    ("black_hole", include_str!("../shaders/black_hole.fs")),
+];
 
 fn make_context() -> Option<GpuContext> {
     GpuContext::new_headless().ok()
+}
+
+/// Name the adapter that produced every number in this run. With the Vega bound
+/// to a (usually-off) VM, the host exposes the GTX 1660 Super and a software
+/// llvmpipe fallback; LowPower headless selection must not silently pick the CPU.
+fn print_adapter(ctx: &GpuContext) {
+    let info = ctx.adapter.get_info();
+    eprintln!(
+        "bench adapter: {} | backend={:?} | device_type={:?} | driver={} {}",
+        info.name, info.backend, info.device_type, info.driver, info.driver_info,
+    );
 }
 
 fn poll(ctx: &GpuContext) {
@@ -196,11 +213,86 @@ fn report_per_deck_slope(_c: &mut Criterion) {
     );
 }
 
+/// Two channels, one heavy gig shader deck each.
+fn setup_two_channel_heavy(context: &GpuContext, src: &str) -> Mixer {
+    let mut mixer = Mixer::new(context, WIDTH, HEIGHT).expect("mixer");
+    for ch_idx in 0..2 {
+        let shader = ISFShader::from_string(src).expect("heavy shader");
+        let deck = Deck::new(context, shader, WIDTH, HEIGHT).expect("shader deck");
+        mixer.channel_mut(ch_idx).expect("channel").add_deck(deck);
+    }
+    mixer
+}
+
+/// Median (CPU-submit µs, total-polled µs) over `samples` warmed renders.
+///
+/// `render()` returns after the last `queue.submit()` without blocking, so its
+/// duration is pure CPU encode+submit. The subsequent poll-to-idle is the GPU
+/// work still outstanding after that last submit. Caveat: GPU execution overlaps
+/// CPU submission, so the tail *under*-counts true GPU time while the CPU figure
+/// is clean — which is the conservative direction for "is this CPU-bound?".
+fn time_split_us(ctx: &GpuContext, mixer: &mut Mixer, samples: usize) -> (u128, u128) {
+    let audio = AudioData::default();
+    let audio_values = AudioValues { sources: Default::default() };
+    for _ in 0..5 {
+        mixer.render(ctx, &audio, &audio_values).expect("warmup");
+        poll(ctx);
+    }
+    let mut cpu = Vec::with_capacity(samples);
+    let mut total = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let t0 = Instant::now();
+        mixer.render(ctx, &audio, &audio_values).expect("render");
+        let c = t0.elapsed().as_micros();
+        poll(ctx);
+        let t = t0.elapsed().as_micros();
+        cpu.push(c);
+        total.push(t);
+    }
+    cpu.sort_unstable();
+    total.sort_unstable();
+    (cpu[samples / 2], total[samples / 2])
+}
+
+/// CPU-submit vs GPU-tail during a real-shader crossfade, on named hardware.
+///
+/// crossfader=0.0 culls channel B (single-channel cost); crossfader=0.5 keeps
+/// both live (the cull at mixer/render.rs:98 does not fire). The 0.0→0.5 delta
+/// is the crossfade tax in isolation. The CPU vs GPU-tail split says whether the
+/// wall is Varda's submission overhead or the GPU's fill rate.
+fn report_crossfade_split(_c: &mut Criterion) {
+    let Some(ctx) = make_context() else { return };
+    print_adapter(&ctx);
+
+    for (name, src) in HEAVY_SHADERS {
+        let mut mixer = setup_two_channel_heavy(&ctx, src);
+
+        mixer.set_crossfader(0.0);
+        let (cpu0, tot0) = time_split_us(&ctx, &mut mixer, 21);
+
+        mixer.set_crossfader(0.5);
+        let (cpu5, tot5) = time_split_us(&ctx, &mut mixer, 21);
+
+        eprintln!(
+            "crossfade split ({name}, {WIDTH}x{HEIGHT}):\n  \
+             cf=0.0 (1 ch live): total={tot0}µs  cpu_submit={cpu0}µs  gpu_tail={}µs\n  \
+             cf=0.5 (2 ch live): total={tot5}µs  cpu_submit={cpu5}µs  gpu_tail={}µs\n  \
+             crossfade tax: total +{}µs  cpu +{}µs  gpu_tail +{}µs",
+            tot0.saturating_sub(cpu0),
+            tot5.saturating_sub(cpu5),
+            tot5.saturating_sub(tot0),
+            cpu5.saturating_sub(cpu0),
+            tot5.saturating_sub(tot0).saturating_sub(cpu5.saturating_sub(cpu0)),
+        );
+    }
+}
+
 criterion_group!(
     benches,
     bench_channel_composite_solid,
     bench_channel_composite_shader,
     bench_mixer_crossfade,
     report_per_deck_slope,
+    report_crossfade_split,
 );
 criterion_main!(benches);
