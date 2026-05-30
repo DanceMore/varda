@@ -287,6 +287,85 @@ fn report_crossfade_split(_c: &mut Criterion) {
     }
 }
 
+/// Single-pass fill cost of every shader in `shaders/`, rendered as a one-deck
+/// channel at 1080p. Opt-in — it loads and times the whole corpus (~1–2 min), so
+/// it stays out of the default `cargo bench`; set VARDA_PROFILE_CORPUS=1 to run.
+///
+/// `fill` is the marginal cost of adding the shader as a layer (total minus the
+/// solid-deck floor of composite+submit); `total` is one deck of it alone. Tiers
+/// are for budgeting layered stacks: T1 stacks freely, T2 a couple at once, T3 is
+/// the raymarch tier — one held centerpiece. Effects/transitions that can't render
+/// standalone as a generator are listed as skipped.
+fn profile_corpus(_c: &mut Criterion) {
+    if std::env::var_os("VARDA_PROFILE_CORPUS").is_none() {
+        return;
+    }
+    let Some(ctx) = make_context() else { return };
+    print_adapter(&ctx);
+
+    // Floor: one solid deck — composite blit + submit, no fragment work.
+    let mut floor_mixer = setup_mixer_solid(&ctx, 1);
+    let floor = time_render_us(&ctx, &mut floor_mixer, 11);
+
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .expect("shaders dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map_or(false, |x| x == "fs"))
+        .collect();
+    paths.sort();
+
+    let mut rows: Vec<(String, u128, u128)> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    // Some corpus shaders are effects/transitions or declare bindings the
+    // generator pipeline layout doesn't provide; building them as a deck is a
+    // hard wgpu validation panic, not a Result. Pre-filter the obvious ones
+    // (any declared image input) and catch the rest per-shader so one bad
+    // shader can't abort the sweep. Silence the panic hook for the loop.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    for path in &paths {
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let Some(shader) = std::fs::read_to_string(path).ok()
+            .and_then(|src| ISFShader::from_string(&src).ok())
+        else { skipped.push(name); continue; };
+
+        let is_generator = shader.metadata.inputs.as_ref()
+            .map_or(true, |ins| ins.iter().all(|i| i.input_type != "image"));
+        if !is_generator { skipped.push(name); continue; }
+
+        let measured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let deck = Deck::new(&ctx, shader, WIDTH, HEIGHT).ok()?;
+            let mut mixer = Mixer::new(&ctx, WIDTH, HEIGHT).ok()?;
+            mixer.channel_mut(0)?.add_deck(deck);
+            Some(time_render_us(&ctx, &mut mixer, 9))
+        }));
+        match measured {
+            Ok(Some(total)) => rows.push((name, total, total.saturating_sub(floor))),
+            _ => skipped.push(name),
+        }
+    }
+
+    std::panic::set_hook(prev_hook);
+
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    let tier = |fill: u128| if fill < 1000 { "T1" } else if fill < 4000 { "T2" } else { "T3" };
+
+    eprintln!("\ncorpus fill profile ({WIDTH}x{HEIGHT}), solid-deck floor = {floor}µs");
+    eprintln!("{:>4}  {:>9}  {:>8}  shader", "tier", "total_us", "fill_us");
+    for (name, total, fill) in &rows {
+        eprintln!("{:>4}  {:>9}  {:>8}  {}", tier(*fill), total, fill, name);
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "\nskipped ({} — not standalone-renderable as a generator deck):\n  {}",
+            skipped.len(), skipped.join(", "),
+        );
+    }
+}
+
 criterion_group!(
     benches,
     bench_channel_composite_solid,
@@ -294,5 +373,6 @@ criterion_group!(
     bench_mixer_crossfade,
     report_per_deck_slope,
     report_crossfade_split,
+    profile_corpus,
 );
 criterion_main!(benches);
