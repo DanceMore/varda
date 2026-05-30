@@ -326,6 +326,15 @@ impl DeckSlot {
     }
 }
 
+/// Metadata for deck compositing, cached to avoid per-frame allocations.
+#[derive(Clone, Copy)]
+struct DeckCompositeInfo {
+    deck_idx: usize,
+    blend_mode: BlendMode,
+    opacity: f32,
+    transition_progress: Option<f64>, // Some = transitioning with shader
+}
+
 /// Channel - Groups multiple decks into a composited layer
 pub struct Channel {
     /// Stable UUID for this channel (8-char hex, persists across saves)
@@ -364,6 +373,18 @@ pub struct Channel {
     pub render_time_ms: f32,
     /// Number of active (rendered) decks in the last frame
     pub active_deck_count: u32,
+
+    /// Sorted indices of decks in this channel, reused every frame to avoid heap allocations.
+    #[serde(skip)]
+    deck_indices: Vec<usize>,
+
+    /// Cached metadata for deck compositing, reused every frame.
+    #[serde(skip)]
+    composite_info: Vec<DeckCompositeInfo>,
+
+    /// Decks that just started transitioning in `tick_auto_transitions`, reused every frame.
+    #[serde(skip)]
+    just_started_transitioning: Vec<usize>,
 }
 
 impl Channel {
@@ -411,6 +432,9 @@ impl Channel {
             blit_pipeline,
             render_time_ms: 0.0,
             active_deck_count: 0,
+            deck_indices: Vec::new(),
+            composite_info: Vec::new(),
+            just_started_transitioning: Vec::new(),
         })
     }
 
@@ -508,8 +532,9 @@ impl Channel {
         self.tick_auto_transitions(dt as f64, bpm);
 
         // Sort decks by z-index
-        let mut deck_indices: Vec<usize> = (0..self.decks.len()).collect();
-        deck_indices.sort_by_key(|&i| self.decks[i].z_index);
+        self.deck_indices.clear();
+        self.deck_indices.extend(0..self.decks.len());
+        self.deck_indices.sort_by_key(|&i| self.decks[i].z_index);
 
         // Check if any deck is solo'd
         let any_solo = self.decks.iter().any(|slot| slot.solo);
@@ -541,26 +566,20 @@ impl Channel {
         }
 
         // Collect render info for visible decks, including transition phase
-        struct DeckCompositeInfo {
-            deck_idx: usize,
-            blend_mode: BlendMode,
-            opacity: f32,
-            transition_progress: Option<f64>, // Some = transitioning with shader
-        }
-
-        let deck_composite_info: Vec<DeckCompositeInfo> = deck_indices.iter()
-            .filter_map(|&idx| {
+        self.composite_info.clear();
+        for &idx in &self.deck_indices {
+            let info = {
                 let slot = &self.decks[idx];
                 let phase = slot.transition_phase();
                 if slot.mute || (any_solo && !slot.solo) || slot.opacity <= 0.0 {
-                    return None;
+                    continue;
                 }
                 // Inactive and Done auto-transition decks don't composite.
                 // Inactive = waiting for turn. Done = already played, no longer needed
                 // (the next deck in sequence gets re-activated to Playing when needed).
                 let has_at = slot.auto_transition.as_ref().map_or(false, |at| at.enabled);
                 if has_at && (phase == DeckTransitionPhase::Inactive || phase == DeckTransitionPhase::Done) {
-                    return None;
+                    continue;
                 }
                 let transition_progress = match phase {
                     DeckTransitionPhase::Transitioning { progress } => Some(progress),
@@ -568,196 +587,52 @@ impl Channel {
                     // as the visible background that transitioning decks reveal.
                     _ => None,
                 };
-                Some(DeckCompositeInfo {
+                DeckCompositeInfo {
                     deck_idx: idx,
                     blend_mode: slot.blend_mode,
                     opacity: slot.opacity,
                     transition_progress,
-                })
-            })
-            .collect();
-
-        // Reorder compositing: non-transitioning decks first, then transitioning.
-        // This ensures composite-so-far always contains all "revealed" content
-        // before the transitioning deck is rendered.
-        let mut non_transitioning: Vec<&DeckCompositeInfo> = Vec::new();
-        let mut transitioning: Vec<&DeckCompositeInfo> = Vec::new();
-        for info in &deck_composite_info {
-            if info.transition_progress.is_some() {
-                transitioning.push(info);
-            } else {
-                non_transitioning.push(info);
-            }
+                }
+            };
+            self.composite_info.push(info);
         }
-        let ordered: Vec<&DeckCompositeInfo> = non_transitioning.into_iter()
-            .chain(transitioning.into_iter())
-            .collect();
 
         // Composite all decks via ping-pong: each blend reads the composite-so-far
         // from background_view() and writes to target_view(), then advance() makes
         // that result the new background — no per-deck snapshot copy.
-        // Submit per-deck to ensure each deck's uniform buffer writes
-        // are consumed before the next deck overwrites them.
+        //
+        // We perform two passes over the `composite_info` to ensure all
+        // "revealed" (non-transitioning) content is composited before any
+        // transitioning deck is rendered on top. This avoids per-frame
+        // allocation of intermediate "ordered" vectors.
         let width = self.composite.width();
         let height = self.composite.height();
+        let mut composite_step: usize = 0;
 
-        for (i, info) in ordered.iter().enumerate() {
-            let slot = &mut self.decks[info.deck_idx];
-
-            // Check if this deck is transitioning with a shader
-            if let Some(progress) = info.transition_progress {
-                if let Some(effect) = slot.transition_effect.as_mut().filter(|_| i > 0) {
-                    // Run transition shader: start=deck (outgoing), end=composite-below (incoming)
-                    let uniforms = ISFUniforms {
-                        time,
-                        time_delta: dt,
-                        frame_index: self.frame_count as u32,
-                        pass_index: 0,
-                        render_size: [width as f32, height as f32],
-                        phase_times: [0.0; 4],
-                        ..Default::default()
-                    };
-
-                    // Set progress on the transition shader
-                    effect.params.set("progress", crate::params::ParamValue::Float(progress as f32));
-                    let params_data = effect.params.build_buffer_data();
-                    if let Some(buf) = effect.params.buffer() {
-                        context.queue.write_buffer(buf, 0, &params_data);
-                    }
-
-                    let cmd = effect.pipeline.render_to_cmd(
-                        context,
-                        &slot.deck.texture_view,            // startImage: outgoing deck
-                        self.composite.background_view(),   // endImage: composite below
-                        self.composite.target_view(),       // output: ping-pong target
-                        &uniforms,
-                        effect.params.buffer(),
-                    );
-                    context.queue.submit(std::iter::once(cmd));
-                    self.composite.advance();
-                    continue;
-                }
-
-                // Opacity fade fallback (no shader or first deck)
-                let fade_opacity = info.opacity * (1.0 - progress as f32);
-                if i == 0 {
-                    // First deck: simple blit with alpha blending
-                    self.blit_pipeline.set_opacity(&context.queue, fade_opacity);
-                    let bind_group = self.blit_pipeline.create_bind_group(&context.device, &slot.deck.texture_view);
-                    let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("Channel Composite Encoder (AT fade first)"),
-                    });
-                    {
-                        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("Channel Composite Pass (AT fade first)"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: self.composite.target_view(),
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                        });
-                        self.blit_pipeline.render(&mut render_pass, &bind_group);
-                    }
-                    context.queue.submit(std::iter::once(encoder.finish()));
-                    self.composite.advance();
-                } else {
-                    // Subsequent decks: blend deck + background → target (no snapshot)
-                    self.composite_pipeline.set_params(&context.queue, fade_opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
-                    let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, self.composite.background_view());
-                    let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("Channel Composite Encoder (AT fade)"),
-                    });
-                    {
-                        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("Channel Composite Pass (AT fade)"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: self.composite.target_view(),
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                        });
-                        self.composite_pipeline.render(&mut render_pass, &bind_group);
-                    }
-                    context.queue.submit(std::iter::once(encoder.finish()));
-                    self.composite.advance();
-                }
+        // Pass 1: Non-transitioning decks (the background/stable stack).
+        // Copy `info` to avoid borrow conflict with `self` in `render_composite_step`.
+        for info_idx in 0..self.composite_info.len() {
+            let info = self.composite_info[info_idx];
+            if info.transition_progress.is_some() {
                 continue;
             }
+            self.render_composite_step(context, &info, composite_step, time, dt, width, height)?;
+            composite_step += 1;
+        }
 
-            // Normal compositing
-            if i == 0 {
-                // First deck: simple blit with alpha blending (Normal = just copy)
-                self.blit_pipeline.set_opacity(&context.queue, info.opacity);
-                let bind_group = self.blit_pipeline.create_bind_group(&context.device, &slot.deck.texture_view);
-                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Channel Composite Encoder (first)"),
-                });
-                {
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Channel Composite Pass (first)"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: self.composite.target_view(),
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    self.blit_pipeline.render(&mut render_pass, &bind_group);
-                }
-                context.queue.submit(std::iter::once(encoder.finish()));
-                self.composite.advance();
-            } else {
-                // Subsequent decks: blend src + background → target (no snapshot)
-                self.composite_pipeline.set_params(&context.queue, info.opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
-                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, self.composite.background_view());
-                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Channel Composite Encoder"),
-                });
-                {
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Channel Composite Pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: self.composite.target_view(),
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    self.composite_pipeline.render(&mut render_pass, &bind_group);
-                }
-                context.queue.submit(std::iter::once(encoder.finish()));
-                self.composite.advance();
+        // Pass 2: Transitioning decks (rendered on top of the stable stack).
+        // Copy `info` to avoid borrow conflict with `self` in `render_composite_step`.
+        for info_idx in 0..self.composite_info.len() {
+            let info = self.composite_info[info_idx];
+            if info.transition_progress.is_none() {
+                continue;
             }
+            self.render_composite_step(context, &info, composite_step, time, dt, width, height)?;
+            composite_step += 1;
         }
 
         // If no decks, clear the composite texture to transparent
-        if deck_composite_info.is_empty() {
+        if self.composite_info.is_empty() {
             let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Channel Clear Encoder"),
             });
@@ -843,6 +718,173 @@ impl Channel {
         Ok(())
     }
 
+    /// Render a single deck-compositing step onto the ping-pong target.
+    fn render_composite_step(
+        &mut self,
+        context: &GpuContext,
+        info: &DeckCompositeInfo,
+        step_idx: usize,
+        time: f32,
+        dt: f32,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let slot = &mut self.decks[info.deck_idx];
+
+        // Check if this deck is transitioning with a shader
+        if let Some(progress) = info.transition_progress {
+            if let Some(effect) = slot.transition_effect.as_mut().filter(|_| step_idx > 0) {
+                // Run transition shader: start=deck (outgoing), end=composite-below (incoming)
+                let uniforms = ISFUniforms {
+                    time,
+                    time_delta: dt,
+                    frame_index: self.frame_count as u32,
+                    pass_index: 0,
+                    render_size: [width as f32, height as f32],
+                    phase_times: [0.0; 4],
+                    ..Default::default()
+                };
+
+                // Set progress on the transition shader
+                effect.params.set("progress", crate::params::ParamValue::Float(progress as f32));
+                let params_data = effect.params.build_buffer_data();
+                if let Some(buf) = effect.params.buffer() {
+                    context.queue.write_buffer(buf, 0, &params_data);
+                }
+
+                let cmd = effect.pipeline.render_to_cmd(
+                    context,
+                    &slot.deck.texture_view,            // startImage: outgoing deck
+                    self.composite.background_view(),   // endImage: composite below
+                    self.composite.target_view(),       // output: ping-pong target
+                    &uniforms,
+                    effect.params.buffer(),
+                );
+                context.queue.submit(std::iter::once(cmd));
+                self.composite.advance();
+                return Ok(());
+            }
+
+            // Opacity fade fallback (no shader or first deck)
+            let fade_opacity = info.opacity * (1.0 - progress as f32);
+            if step_idx == 0 {
+                // First deck: simple blit with alpha blending
+                self.blit_pipeline.set_opacity(&context.queue, fade_opacity);
+                let bind_group = self.blit_pipeline.create_bind_group(&context.device, &slot.deck.texture_view);
+                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Channel Composite Encoder (AT fade first)"),
+                });
+                {
+                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Channel Composite Pass (AT fade first)"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: self.composite.target_view(),
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.blit_pipeline.render(&mut render_pass, &bind_group);
+                }
+                context.queue.submit(std::iter::once(encoder.finish()));
+                self.composite.advance();
+            } else {
+                // Subsequent decks: blend deck + background → target (no snapshot)
+                self.composite_pipeline.set_params(&context.queue, fade_opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
+                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, self.composite.background_view());
+                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Channel Composite Encoder (AT fade)"),
+                });
+                {
+                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Channel Composite Pass (AT fade)"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: self.composite.target_view(),
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.composite_pipeline.render(&mut render_pass, &bind_group);
+                }
+                context.queue.submit(std::iter::once(encoder.finish()));
+                self.composite.advance();
+            }
+            return Ok(());
+        }
+
+        // Normal compositing
+        if step_idx == 0 {
+            // First deck: simple blit with alpha blending (Normal = just copy)
+            self.blit_pipeline.set_opacity(&context.queue, info.opacity);
+            let bind_group = self.blit_pipeline.create_bind_group(&context.device, &slot.deck.texture_view);
+            let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Channel Composite Encoder (first)"),
+            });
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Channel Composite Pass (first)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: self.composite.target_view(),
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                self.blit_pipeline.render(&mut render_pass, &bind_group);
+            }
+            context.queue.submit(std::iter::once(encoder.finish()));
+            self.composite.advance();
+        } else {
+            // Subsequent decks: blend src + background → target (no snapshot)
+            self.composite_pipeline.set_params(&context.queue, info.opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0]);
+            let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, self.composite.background_view());
+            let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Channel Composite Encoder"),
+            });
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Channel Composite Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: self.composite.target_view(),
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                self.composite_pipeline.render(&mut render_pass, &bind_group);
+            }
+            context.queue.submit(std::iter::once(encoder.finish()));
+            self.composite.advance();
+        }
+
+        Ok(())
+    }
+
     /// Resize the channel's textures
     pub fn resize(&mut self, context: &GpuContext, width: u32, height: u32) {
         self.composite.resize(context, width, height);
@@ -922,11 +964,12 @@ impl Channel {
     pub fn tick_auto_transitions(&mut self, dt: f64, bpm: Option<f64>) {
         // Determine the "active" deck — topmost visible with auto-transition enabled.
         // Sort by z-index descending to find the top deck.
-        let mut sorted: Vec<usize> = (0..self.decks.len()).collect();
-        sorted.sort_by_key(|&i| std::cmp::Reverse(self.decks[i].z_index));
+        self.deck_indices.clear();
+        self.deck_indices.extend(0..self.decks.len());
+        self.deck_indices.sort_by_key(|&i| std::cmp::Reverse(self.decks[i].z_index));
 
         // Find the topmost deck that is visible and has auto-transition enabled
-        let active_idx = sorted.iter().copied().find(|&i| {
+        let active_idx = self.deck_indices.iter().copied().find(|&i| {
             let slot = &self.decks[i];
             let has_at = slot.auto_transition.as_ref().map_or(false, |at| at.enabled);
             let phase = slot.transition_phase();
@@ -934,7 +977,7 @@ impl Channel {
         });
 
         // Update phase for each deck, collecting indices that just started transitioning
-        let mut just_started_transitioning: Vec<usize> = Vec::new();
+        self.just_started_transitioning.clear();
 
         for i in 0..self.decks.len() {
             let is_active = active_idx == Some(i);
@@ -968,7 +1011,7 @@ impl Channel {
 
                     if should_transition {
                         at.phase = DeckTransitionPhase::Transitioning { progress: 0.0 };
-                        just_started_transitioning.push(i);
+                        self.just_started_transitioning.push(i);
                     }
                 }
                 DeckTransitionPhase::Transitioning { ref mut progress } => {
@@ -991,7 +1034,7 @@ impl Channel {
         // Activate the next deck for each deck that just started transitioning.
         // This makes the next deck visible as the background the transition reveals.
         // First try Inactive decks; if none, wrap around to the first Done deck (loop).
-        for _trigger_idx in just_started_transitioning {
+        for _trigger_idx in &self.just_started_transitioning {
             let mut activated = false;
             // Try Inactive first
             for j in 0..self.decks.len() {
