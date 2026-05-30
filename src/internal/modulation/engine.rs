@@ -1,8 +1,8 @@
 //! ModulationEngine — manages sources, assignments, and per-frame evaluation.
 
+use super::{AudioValues, ModulationSource, ModulationSourceEntry, ParamModulation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use super::{ModulationSource, ModulationSourceEntry, AudioValues, ParamModulation};
 
 /// A resolved modulation assignment that uses a direct index into the source value vector.
 /// Used to eliminate HashMap lookups in the render hot path.
@@ -47,7 +47,9 @@ pub struct ModulationEngine {
 }
 
 impl ModulationEngine {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     fn rebuild_uuid_index(&mut self) {
         self.uuid_to_idx.clear();
@@ -70,7 +72,8 @@ impl ModulationEngine {
         self.sources.push(entry);
         self.prev_values.push(0.0);
         self.current_values.push(0.0);
-        self.uuid_to_idx.insert(uuid.clone(), self.sources.len() - 1);
+        self.uuid_to_idx
+            .insert(uuid.clone(), self.sources.len() - 1);
         self.invalidate_evaluation_order();
         self.version += 1;
         uuid
@@ -82,7 +85,8 @@ impl ModulationEngine {
         self.sources.push(entry);
         self.prev_values.push(0.0);
         self.current_values.push(0.0);
-        self.uuid_to_idx.insert(uuid.clone(), self.sources.len() - 1);
+        self.uuid_to_idx
+            .insert(uuid.clone(), self.sources.len() - 1);
         self.invalidate_evaluation_order();
         self.version += 1;
         uuid
@@ -92,8 +96,12 @@ impl ModulationEngine {
     pub fn remove_source(&mut self, uuid: &str) {
         if let Some(idx) = self.uuid_to_idx.get(uuid).copied() {
             self.sources.remove(idx);
-            if idx < self.prev_values.len() { self.prev_values.remove(idx); }
-            if idx < self.current_values.len() { self.current_values.remove(idx); }
+            if idx < self.prev_values.len() {
+                self.prev_values.remove(idx);
+            }
+            if idx < self.current_values.len() {
+                self.current_values.remove(idx);
+            }
             // Remove assignments referencing this source (no reindexing needed)
             for mods in self.assignments.values_mut() {
                 mods.retain(|m| m.source_id != uuid);
@@ -114,19 +122,38 @@ impl ModulationEngine {
         self.assignments.retain(|k, _| !k.starts_with(prefix));
         let removed = before - self.assignments.len();
         if removed > 0 {
-            log::info!("Removed {} orphaned modulation assignments with prefix '{}'", removed, prefix);
+            log::info!(
+                "Removed {} orphaned modulation assignments with prefix '{}'",
+                removed,
+                prefix
+            );
             self.invalidate_evaluation_order();
             self.version += 1;
         }
     }
 
-    pub fn assign(&mut self, param_name: &str, source_id: &str, amount: f32, component: Option<usize>) {
+    pub fn assign(
+        &mut self,
+        param_name: &str,
+        source_id: &str,
+        amount: f32,
+        component: Option<usize>,
+    ) {
         if !self.uuid_to_idx.contains_key(source_id) {
             self.ensure_index();
-            if !self.uuid_to_idx.contains_key(source_id) { return; }
+            if !self.uuid_to_idx.contains_key(source_id) {
+                return;
+            }
         }
-        let modulation = ParamModulation { source_id: source_id.to_string(), amount, component };
-        self.assignments.entry(param_name.to_string()).or_default().push(modulation);
+        let modulation = ParamModulation {
+            source_id: source_id.to_string(),
+            amount,
+            component,
+        };
+        self.assignments
+            .entry(param_name.to_string())
+            .or_default()
+            .push(modulation);
         // Only mod-on-mod assignments alter the topology; non-mod assignments
         // don't change evaluation order but invalidating universally keeps
         // the cache invariant simple.
@@ -134,7 +161,13 @@ impl ModulationEngine {
         self.version += 1;
     }
 
-    pub fn assign_mod_on_mod(&mut self, target_uuid: &str, param_name: &str, modulator_uuid: &str, amount: f32) {
+    pub fn assign_mod_on_mod(
+        &mut self,
+        target_uuid: &str,
+        param_name: &str,
+        modulator_uuid: &str,
+        amount: f32,
+    ) {
         let key = format!("mod:{}:{}", target_uuid, param_name);
         self.assign(&key, modulator_uuid, amount, None);
         // assign() already increments version
@@ -170,7 +203,10 @@ impl ModulationEngine {
     /// Get a mutable reference to a source by UUID
     pub fn source_mut(&mut self, uuid: &str) -> Option<&mut ModulationSource> {
         self.ensure_index();
-        self.uuid_to_idx.get(uuid).copied().map(|idx| &mut self.sources[idx].source)
+        self.uuid_to_idx
+            .get(uuid)
+            .copied()
+            .map(|idx| &mut self.sources[idx].source)
     }
 
     /// Find source by UUID (returns exists check)
@@ -178,7 +214,7 @@ impl ModulationEngine {
         self.sources.iter().any(|e| e.uuid == uuid)
     }
 
-    fn source_idx(&self, uuid: &str) -> Option<usize> {
+    pub(crate) fn source_idx(&self, uuid: &str) -> Option<usize> {
         self.uuid_to_idx.get(uuid).copied()
     }
 
@@ -215,7 +251,11 @@ impl ModulationEngine {
         }
     }
 
-    fn apply_mod_on_mod_optimized(&self, idx: usize, source: &ModulationSource) -> ModulationSource {
+    fn apply_mod_on_mod_optimized(
+        &self,
+        idx: usize,
+        source: &ModulationSource,
+    ) -> ModulationSource {
         let resolved_params = &self.resolved_mod_on_mod[idx];
         if resolved_params.is_empty() {
             return source.clone();
@@ -231,18 +271,31 @@ impl ModulationEngine {
             }
 
             match &mut modified {
-                ModulationSource::LFO { frequency, phase, amplitude, .. } => match param_name.as_str() {
+                ModulationSource::LFO {
+                    frequency,
+                    phase,
+                    amplitude,
+                    ..
+                } => match param_name.as_str() {
                     "frequency" => *frequency = (*frequency + offset).max(0.001),
                     "phase" => *phase = (*phase + offset).clamp(0.0, 1.0),
                     "amplitude" => *amplitude = (*amplitude + offset).clamp(0.0, 1.0),
                     _ => {}
                 },
-                ModulationSource::AudioBand { gain, smoothing, .. } => match param_name.as_str() {
+                ModulationSource::AudioBand {
+                    gain, smoothing, ..
+                } => match param_name.as_str() {
                     "gain" => *gain = (*gain + offset).max(0.0),
                     "smoothing" => *smoothing = (*smoothing + offset).clamp(0.0, 0.99),
                     _ => {}
                 },
-                ModulationSource::ADSR { attack, decay, sustain, release, .. } => match param_name.as_str() {
+                ModulationSource::ADSR {
+                    attack,
+                    decay,
+                    sustain,
+                    release,
+                    ..
+                } => match param_name.as_str() {
                     "attack" => *attack = (*attack + offset).max(0.001),
                     "decay" => *decay = (*decay + offset).max(0.001),
                     "sustain" => *sustain = (*sustain + offset).clamp(0.0, 1.0),
@@ -305,17 +358,23 @@ impl ModulationEngine {
         for _pass in 0..MAX_MOD_DEPTH {
             let mut progress = false;
             for i in 0..n {
-                if evaluated[i] { continue; }
+                if evaluated[i] {
+                    continue;
+                }
                 if deps[i].iter().all(|&d| evaluated[d]) {
                     order.push(i);
                     evaluated[i] = true;
                     progress = true;
                 }
             }
-            if !progress { break; }
+            if !progress {
+                break;
+            }
         }
         for i in 0..n {
-            if !evaluated[i] { order.push(i); }
+            if !evaluated[i] {
+                order.push(i);
+            }
         }
         self.cached_order = order.clone();
         self.cached_order_valid = true;
@@ -325,7 +384,11 @@ impl ModulationEngine {
     /// Parse mod-on-mod key: "mod:{uuid}:{param}" → Some(uuid)
     pub(crate) fn parse_mod_target(key: &str) -> Option<&str> {
         let parts: Vec<&str> = key.splitn(3, ':').collect();
-        if parts.len() >= 2 && parts[0] == "mod" { Some(parts[1]) } else { None }
+        if parts.len() >= 2 && parts[0] == "mod" {
+            Some(parts[1])
+        } else {
+            None
+        }
     }
 
     /// Update all source values for the current frame
@@ -334,22 +397,39 @@ impl ModulationEngine {
         let dt = self.prev_time.map_or(0.016, |prev| time - prev);
         self.prev_time = Some(time);
 
-        while self.prev_values.len() < self.sources.len() { self.prev_values.push(0.0); }
-        while self.current_values.len() < self.sources.len() { self.current_values.push(0.0); }
+        while self.prev_values.len() < self.sources.len() {
+            self.prev_values.push(0.0);
+        }
+        while self.current_values.len() < self.sources.len() {
+            self.current_values.push(0.0);
+        }
 
         let order = self.evaluation_order();
         for i in order {
             // Optimization: avoid cloning and applying mod-on-mod if no assignments exist for this source
             let value = if self.resolved_mod_on_mod[i].is_empty() {
-                self.sources[i].source.calculate(time, dt, audio, self.prev_values[i])
+                self.sources[i]
+                    .source
+                    .calculate(time, dt, audio, self.prev_values[i])
             } else {
                 let mut effective = self.apply_mod_on_mod_optimized(i, &self.sources[i].source);
                 let val = effective.calculate(time, dt, audio, self.prev_values[i]);
 
                 // Copy back mutable state changes (ADSR stage progression)
-                if let (ModulationSource::ADSR { stage, stage_time, current_level, .. },
-                        ModulationSource::ADSR { stage: eff_stage, stage_time: eff_st, current_level: eff_cl, .. }) =
-                    (&mut self.sources[i].source, &effective)
+                if let (
+                    ModulationSource::ADSR {
+                        stage,
+                        stage_time,
+                        current_level,
+                        ..
+                    },
+                    ModulationSource::ADSR {
+                        stage: eff_stage,
+                        stage_time: eff_st,
+                        current_level: eff_cl,
+                        ..
+                    },
+                ) = (&mut self.sources[i].source, &effective)
                 {
                     *stage = *eff_stage;
                     *stage_time = *eff_st;
@@ -370,7 +450,9 @@ impl ModulationEngine {
 
     /// Get the total modulation offset for a specific component (color params)
     pub fn get_modulation_for_component(&self, param_name: &str, component: Option<usize>) -> f32 {
-        let Some(mods) = self.assignments.get(param_name) else { return 0.0; };
+        let Some(mods) = self.assignments.get(param_name) else {
+            return 0.0;
+        };
         let mut total = 0.0;
         for m in mods {
             if m.component == component {
@@ -386,18 +468,25 @@ impl ModulationEngine {
 
     /// Check if a parameter has any modulations assigned
     pub fn has_modulation(&self, param_name: &str) -> bool {
-        self.assignments.get(param_name).map_or(false, |v| !v.is_empty())
+        self.assignments
+            .get(param_name)
+            .map_or(false, |v| !v.is_empty())
     }
 
     /// Get number of sources
-    pub fn source_count(&self) -> usize { self.sources.len() }
+    pub fn source_count(&self) -> usize {
+        self.sources.len()
+    }
 
     /// Get current computed values for all sources (for UI visualization)
-    pub fn current_values(&self) -> &[f32] { &self.current_values }
+    pub fn current_values(&self) -> &[f32] {
+        &self.current_values
+    }
 
     /// Get current value for a source by UUID
     pub fn current_value_for(&self, uuid: &str) -> f32 {
-        self.uuid_to_idx.get(uuid)
+        self.uuid_to_idx
+            .get(uuid)
             .and_then(|&idx| self.current_values.get(idx).copied())
             .unwrap_or(0.0)
     }
@@ -408,7 +497,9 @@ impl ModulationEngine {
     }
 
     /// Iterate over all assignments (key → modulations).
-    pub fn assignments_iter(&self) -> impl Iterator<Item = (&String, &Vec<super::ParamModulation>)> {
+    pub fn assignments_iter(
+        &self,
+    ) -> impl Iterator<Item = (&String, &Vec<super::ParamModulation>)> {
         self.assignments.iter()
     }
 }
