@@ -12,6 +12,10 @@ pub mod transition;
 pub mod warp;
 pub mod ping_pong;
 
+/// Maximum number of parameter slots available for batched rendering.
+/// Covers all decks in a channel or all channels in the mixer.
+pub const MAX_RENDER_SLOTS: usize = 128;
+
 pub use context::*;
 pub use dome::*;
 pub use dome_preview::*;

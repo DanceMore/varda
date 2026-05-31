@@ -75,6 +75,8 @@ pub struct UnifiedPipeline {
     pub user_params_binding: u32,
     /// The primary format this pipeline was created for
     pub surface_format: wgpu::TextureFormat,
+    /// Byte stride between parameter slots, aligned to device requirements.
+    pub slot_stride: u32,
 }
 
 
@@ -95,6 +97,10 @@ impl UnifiedPipeline {
         needs_float_pipeline: bool,
         num_imported_textures: usize,
     ) -> Result<Self> {
+        let alignment = device.limits().min_uniform_buffer_offset_alignment as usize;
+        let uniform_size = std::mem::size_of::<ISFUniforms>();
+        let slot_stride = ((uniform_size + alignment - 1) / alignment * alignment) as u32;
+
         // Convert SPIR-V to WGSL using naga
         let spirv_bytes: Vec<u8> = spirv
             .iter()
@@ -119,12 +125,12 @@ impl UnifiedPipeline {
             source: wgpu::ShaderSource::Wgsl(wgsl.into()),
         });
 
-        // Create uniform buffer
-        let uniforms = ISFUniforms::default();
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ISF Uniform Buffer"),
-            contents: bytemuck::cast_slice(&[uniforms]),
+        // Create multi-slot uniform buffer
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ISF Unified Multi-slot Uniform Buffer"),
+            size: (crate::renderer::MAX_RENDER_SLOTS as u64 * slot_stride as u64),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let has_textures = has_input_image || num_pass_buffers > 0 || num_imported_textures > 0;
@@ -133,14 +139,14 @@ impl UnifiedPipeline {
         let mut layout_entries = vec![];
         let mut next_binding: u32 = 0;
 
-        // Binding 0: ISFUniforms (always present)
+        // Binding 0: ISFUniforms (always present) - with dynamic offset for batching
         layout_entries.push(wgpu::BindGroupLayoutEntry {
             binding: next_binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<ISFUniforms>() as u64),
+                has_dynamic_offset: true,
+                min_binding_size: std::num::NonZeroU64::new(uniform_size as u64),
             },
             count: None,
         });
@@ -342,6 +348,7 @@ impl UnifiedPipeline {
             default_user_params_buffer,
             user_params_binding,
             surface_format,
+            slot_stride,
         })
     }
 
@@ -362,10 +369,14 @@ impl UnifiedPipeline {
         let mut entries = vec![];
         let mut next_binding: u32 = 0;
 
-        // Binding 0: Uniforms
+        // Binding 0: Uniforms (dynamic offset handled during set_bind_group)
         entries.push(wgpu::BindGroupEntry {
             binding: next_binding,
-            resource: self.uniform_buffer.as_entire_binding(),
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &self.uniform_buffer,
+                offset: 0,
+                size: Some(std::num::NonZeroU64::new(std::mem::size_of::<ISFUniforms>() as u64).unwrap()),
+            }),
         });
         next_binding += 1;
 
@@ -432,9 +443,15 @@ impl UnifiedPipeline {
         self.create_bind_group(device, None, &[], &[], Some(user_params_buffer))
     }
 
-    /// Update uniforms
+    /// Update uniforms at a specific slot
+    pub fn set_uniforms_at_slot(&self, queue: &wgpu::Queue, uniforms: &ISFUniforms, slot_idx: usize) {
+        let offset = (slot_idx as u64 * self.slot_stride as u64) as wgpu::BufferAddress;
+        queue.write_buffer(&self.uniform_buffer, offset, bytemuck::cast_slice(&[*uniforms]));
+    }
+
+    /// Update uniforms in slot 0 (compatibility shim)
     pub fn update_uniforms(&self, queue: &wgpu::Queue, uniforms: &ISFUniforms) {
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[*uniforms]));
+        self.set_uniforms_at_slot(queue, uniforms, 0);
     }
 
     /// Get the pipeline for a specific target format
@@ -446,5 +463,19 @@ impl UnifiedPipeline {
         } else {
             &self.pipeline
         }
+    }
+
+    /// Render with a specific parameter slot (dynamic offset)
+    pub fn render_with_slot<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        pipeline: &'a wgpu::RenderPipeline,
+        bind_group: &'a wgpu::BindGroup,
+        slot_idx: usize,
+    ) {
+        let dynamic_offset = (slot_idx as u32 * self.slot_stride) as u32;
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, bind_group, &[dynamic_offset]);
+        render_pass.draw(0..3, 0..1);
     }
 }

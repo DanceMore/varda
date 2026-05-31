@@ -204,6 +204,7 @@ impl Effect {
             .collect();
 
         let has_targeted_passes = self.passes.iter().any(|p| p.target.is_some());
+        let mut slot_idx: usize = 0;
 
         if has_targeted_passes {
             // Multi-pass effect: run targeted passes first, then final pass to output
@@ -226,7 +227,12 @@ impl Effect {
                 for _iter in 0..iterations {
                     let mut pass_uniforms = *uniforms;
                     pass_uniforms.pass_index = pass_idx as i32;
-                    self.pipeline.update_uniforms(&context.queue, &pass_uniforms);
+
+                    if slot_idx < crate::renderer::MAX_RENDER_SLOTS {
+                        self.pipeline.set_uniforms_at_slot(&context.queue, &pass_uniforms, slot_idx);
+                    } else {
+                        self.pipeline.update_uniforms(&context.queue, &pass_uniforms);
+                    }
 
                     // Bind every targeted pass's read_view in declaration order.
                     // A non-persistent buffer whose target equals THIS pass's
@@ -281,15 +287,27 @@ impl Effect {
                             occlusion_query_set: None,
                         });
 
-                        render_pass.set_pipeline(self.pipeline.pipeline_for_format(format));
-                        render_pass.set_bind_group(0, &bind_group, &[]);
-                        render_pass.draw(0..3, 0..1);
+                        let pipeline = self.pipeline.pipeline_for_format(format);
+                        if slot_idx < crate::renderer::MAX_RENDER_SLOTS {
+                            self.pipeline.render_with_slot(&mut render_pass, pipeline, &bind_group, slot_idx);
+                            slot_idx += 1;
+                        } else {
+                            render_pass.set_pipeline(pipeline);
+                            render_pass.set_bind_group(0, &bind_group, &[]);
+                            render_pass.draw(0..3, 0..1);
+                        }
                     }
 
-                    // Multipass intermediate passes MUST submit immediately —
-                    // update_uniforms() overwrites the same buffer each iteration,
-                    // so batching would cause all passes to see the last pass's data.
-                    context.queue.submit(std::iter::once(encoder.finish()));
+                    // If we've run out of slots, we must flush the accumulated commands
+                    // to the GPU before we can reuse slot 0 for the next batch.
+                    // This ensures execution order and prevents uniform data corruption.
+                    if slot_idx >= crate::renderer::MAX_RENDER_SLOTS {
+                        cmd_buffers.push(encoder.finish());
+                        context.queue.submit(cmd_buffers.drain(..));
+                        slot_idx = 0;
+                    } else {
+                        cmd_buffers.push(encoder.finish());
+                    }
 
                     if let Some(pb) = self.pass_buffers.get_mut(&target_name) {
                         pb.swap();
@@ -300,7 +318,12 @@ impl Effect {
             // Final pass: render to output_view using pass buffer results + input
             let mut final_uniforms = *uniforms;
             final_uniforms.pass_index = self.passes.len() as i32;
-            self.pipeline.update_uniforms(&context.queue, &final_uniforms);
+
+            if slot_idx < crate::renderer::MAX_RENDER_SLOTS {
+                self.pipeline.set_uniforms_at_slot(&context.queue, &final_uniforms, slot_idx);
+            } else {
+                self.pipeline.update_uniforms(&context.queue, &final_uniforms);
+            }
 
             let pass_buffer_views: Vec<&wgpu::TextureView> = self.passes
                 .iter()
@@ -339,15 +362,21 @@ impl Effect {
                     occlusion_query_set: None,
                 });
 
-                render_pass.set_pipeline(self.pipeline.pipeline_for_format(self.target_format));
-                render_pass.set_bind_group(0, &bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
+                let pipeline = self.pipeline.pipeline_for_format(self.target_format);
+                if slot_idx < crate::renderer::MAX_RENDER_SLOTS {
+                    self.pipeline.render_with_slot(&mut render_pass, pipeline, &bind_group, slot_idx);
+                } else {
+                    render_pass.set_pipeline(pipeline);
+                    render_pass.set_bind_group(0, &bind_group, &[]);
+                    render_pass.draw(0..3, 0..1);
+                }
             }
 
             cmd_buffers.push(encoder.finish());
         } else {
             // Simple single-pass effect
-            self.pipeline.update_uniforms(&context.queue, uniforms);
+            let slot_idx = 0;
+            self.pipeline.set_uniforms_at_slot(&context.queue, uniforms, slot_idx);
 
             let Some(bind_group) = self.pipeline.create_bind_group(
                 &context.device,
@@ -380,9 +409,7 @@ impl Effect {
                     occlusion_query_set: None,
                 });
 
-                render_pass.set_pipeline(&self.pipeline.pipeline);
-                render_pass.set_bind_group(0, &bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
+                self.pipeline.render_with_slot(&mut render_pass, &self.pipeline.pipeline, &bind_group, slot_idx);
             }
 
             cmd_buffers.push(encoder.finish());
