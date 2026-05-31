@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn step_sequencer_basic() {
         let mut seq = ModulationSource::StepSequencer {
-            steps: vec![0.0, 0.5, 1.0, 0.5],
+            steps: Arc::from(vec![0.0, 0.5, 1.0, 0.5]),
             rate: 4.0,
             interpolation: StepInterpolation::None,
             bipolar: false,
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn step_sequencer_linear_interpolation() {
         let mut seq = ModulationSource::StepSequencer {
-            steps: vec![0.0, 1.0],
+            steps: Arc::from(vec![0.0, 1.0]),
             rate: 1.0,
             interpolation: StepInterpolation::Linear,
             bipolar: false,
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn step_sequencer_bipolar() {
         let mut seq = ModulationSource::StepSequencer {
-            steps: vec![0.0, 1.0],
+            steps: Arc::from(vec![0.0, 1.0]),
             rate: 1.0,
             interpolation: StepInterpolation::None,
             bipolar: true,
@@ -351,7 +351,7 @@ mod tests {
     #[test]
     fn step_sequencer_empty_returns_zero() {
         let mut seq = ModulationSource::StepSequencer {
-            steps: vec![],
+            steps: Arc::from(vec![]),
             rate: 1.0,
             interpolation: StepInterpolation::None,
             bipolar: false,
@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn step_sequencer_smooth_interpolation() {
         let mut seq = ModulationSource::StepSequencer {
-            steps: vec![0.0, 1.0],
+            steps: Arc::from(vec![0.0, 1.0]),
             rate: 1.0,
             interpolation: StepInterpolation::Smooth,
             bipolar: false,
@@ -874,7 +874,7 @@ mod tests {
     #[test]
     fn chaos_step_sequencer_single_step() {
         let mut seq = ModulationSource::StepSequencer {
-            steps: vec![0.75],
+            steps: Arc::from(vec![0.75]),
             rate: 1.0,
             interpolation: StepInterpolation::Linear,
             bipolar: false,
@@ -887,7 +887,7 @@ mod tests {
     #[test]
     fn chaos_step_sequencer_nan_rate_does_not_panic() {
         let mut seq = ModulationSource::StepSequencer {
-            steps: vec![0.0, 0.5, 1.0],
+            steps: Arc::from(vec![0.0, 0.5, 1.0]),
             rate: f32::NAN,
             interpolation: StepInterpolation::None,
             bipolar: false,
@@ -900,7 +900,7 @@ mod tests {
     #[test]
     fn chaos_step_sequencer_infinity_rate_does_not_panic() {
         let mut seq = ModulationSource::StepSequencer {
-            steps: vec![0.0, 1.0],
+            steps: Arc::from(vec![0.0, 1.0]),
             rate: f32::INFINITY,
             interpolation: StepInterpolation::Smooth,
             bipolar: false,
@@ -913,7 +913,7 @@ mod tests {
     #[test]
     fn chaos_step_sequencer_zero_rate() {
         let mut seq = ModulationSource::StepSequencer {
-            steps: vec![0.2, 0.8],
+            steps: Arc::from(vec![0.2, 0.8]),
             rate: 0.0,
             interpolation: StepInterpolation::Linear,
             bipolar: false,
@@ -926,7 +926,7 @@ mod tests {
     #[test]
     fn chaos_step_sequencer_nan_step_values() {
         let mut seq = ModulationSource::StepSequencer {
-            steps: vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5],
+            steps: Arc::from(vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5]),
             rate: 1.0,
             interpolation: StepInterpolation::Linear,
             bipolar: false,
