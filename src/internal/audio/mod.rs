@@ -55,6 +55,14 @@ pub struct AudioData {
     pub time_since_beat: f32,
     /// Sample rate of the audio stream (needed to convert FFT bins to Hz)
     pub sample_rate: f32,
+    /// Pre-calculated energy for the Bass band (20-250Hz).
+    pub bass: f32,
+    /// Pre-calculated energy for the Mid band (250-2000Hz).
+    pub mid: f32,
+    /// Pre-calculated energy for the Treble band (2000-20000Hz).
+    pub treble: f32,
+    /// Pre-calculated energy for the Full band (20-20000Hz).
+    pub full: f32,
 }
 
 impl Default for AudioData {
@@ -66,8 +74,29 @@ impl Default for AudioData {
             bpm: None,
             time_since_beat: 0.0,
             sample_rate: 48000.0,
+            bass: 0.0,
+            mid: 0.0,
+            treble: 0.0,
+            full: 0.0,
         }
     }
+}
+
+/// Compute energy in a frequency range from FFT magnitude data.
+/// Shared between AudioData and AudioSourceValues.
+pub(crate) fn compute_energy_from_fft(fft: &[f32], sample_rate: f32, freq_low: f32, freq_high: f32) -> f32 {
+    if fft.is_empty() || sample_rate <= 0.0 { return 0.0; }
+    let fft_size = fft.len() * 2;
+    let bin_width = sample_rate / fft_size as f32;
+    let bin_low = ((freq_low / bin_width).floor() as usize).min(fft.len() - 1);
+    let bin_high = ((freq_high / bin_width).ceil() as usize).min(fft.len());
+    if bin_high <= bin_low { return 0.0; }
+    let slice = &fft[bin_low..bin_high];
+    // RMS energy then dB-based perceptual mapping
+    let rms = (slice.iter().map(|v| v * v).sum::<f32>() / slice.len() as f32).sqrt();
+    if rms < 1e-6 { return 0.0; }
+    let db = 20.0 * rms.log10();
+    ((db + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
 impl AudioData {
@@ -80,33 +109,32 @@ impl AudioData {
     /// Get energy in an arbitrary frequency range (Hz).
     /// This is the core method — bass/mid/treble are just presets on top of it.
     pub fn energy_in_range(&self, freq_low: f32, freq_high: f32) -> f32 {
-        if self.fft.is_empty() { return 0.0; }
-        let bw = self.bin_width();
-        if bw <= 0.0 { return 0.0; }
-        let bin_low = ((freq_low / bw).floor() as usize).min(self.fft.len() - 1);
-        let bin_high = ((freq_high / bw).ceil() as usize).min(self.fft.len());
-        if bin_high <= bin_low { return 0.0; }
-        let slice = &self.fft[bin_low..bin_high];
-        // RMS energy then dB-based perceptual mapping
-        let rms = (slice.iter().map(|v| v * v).sum::<f32>() / slice.len() as f32).sqrt();
-        if rms < 1e-6 { return 0.0; }
-        let db = 20.0 * rms.log10();
-        ((db + 60.0) / 60.0).clamp(0.0, 1.0)
+        // Optimization: return pre-calculated standard bands if possible.
+        if (freq_low - 20.0).abs() < 0.1 {
+            if (freq_high - 250.0).abs() < 0.1 { return self.bass; }
+            if (freq_high - 20000.0).abs() < 0.1 { return self.full; }
+        } else if (freq_low - 250.0).abs() < 0.1 && (freq_high - 2000.0).abs() < 0.1 {
+            return self.mid;
+        } else if (freq_low - 2000.0).abs() < 0.1 && (freq_high - 20000.0).abs() < 0.1 {
+            return self.treble;
+        }
+
+        compute_energy_from_fft(&self.fft, self.sample_rate, freq_low, freq_high)
     }
 
     /// Get bass level (low frequencies, ~20-250Hz)
     pub fn bass(&self) -> f32 {
-        self.energy_in_range(20.0, 250.0)
+        self.bass
     }
 
     /// Get mid level (mid frequencies, ~250-2000Hz)
     pub fn mid(&self) -> f32 {
-        self.energy_in_range(250.0, 2000.0)
+        self.mid
     }
 
     /// Get treble level (high frequencies, ~2000Hz+)
     pub fn treble(&self) -> f32 {
-        self.energy_in_range(2000.0, 20000.0)
+        self.treble
     }
 
     /// Get beat phase (0.0 to 1.0, where 0.0 is on the beat)
@@ -421,6 +449,11 @@ impl AudioManager {
                     let time_since_beat =
                         now.duration_since(last_beat_time).as_secs_f32();
 
+                    let bass = compute_energy_from_fft(&fft_magnitudes, sample_rate, 20.0, 250.0);
+                    let mid = compute_energy_from_fft(&fft_magnitudes, sample_rate, 250.0, 2000.0);
+                    let treble = compute_energy_from_fft(&fft_magnitudes, sample_rate, 2000.0, 20000.0);
+                    let full = compute_energy_from_fft(&fft_magnitudes, sample_rate, 20.0, 20000.0);
+
                     let data = AudioData {
                         waveform: Arc::from(waveform),
                         fft: Arc::from(fft_magnitudes),
@@ -428,6 +461,10 @@ impl AudioManager {
                         bpm: current_bpm,
                         time_since_beat,
                         sample_rate,
+                        bass,
+                        mid,
+                        treble,
+                        full,
                     };
 
                     let _ = sender.try_send(data);

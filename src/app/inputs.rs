@@ -20,6 +20,10 @@ impl VardaApp {
                     fft: data.fft.clone(),
                     level: data.level,
                     sample_rate: data.sample_rate,
+                    bass: data.bass,
+                    mid: data.mid,
+                    treble: data.treble,
+                    full: data.full,
                 },
             );
         }
