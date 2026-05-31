@@ -8,6 +8,14 @@ pub struct AudioSourceValues {
     pub fft: Arc<[f32]>,
     pub level: f32,
     pub sample_rate: f32,
+    /// Pre-calculated energy for the Bass band (20-250Hz).
+    pub bass: f32,
+    /// Pre-calculated energy for the Mid band (250-2000Hz).
+    pub mid: f32,
+    /// Pre-calculated energy for the Treble band (2000-20000Hz).
+    pub treble: f32,
+    /// Pre-calculated energy for the Full band (20-20000Hz).
+    pub full: f32,
 }
 
 impl AudioSourceValues {
@@ -15,17 +23,17 @@ impl AudioSourceValues {
     /// Returns a perceptually-scaled value in roughly 0.0–1.0 range
     /// suitable for driving modulation (dB-based mapping).
     pub fn energy_in_range(&self, freq_low: f32, freq_high: f32) -> f32 {
-        if self.fft.is_empty() || self.sample_rate <= 0.0 { return 0.0; }
-        let fft_size = self.fft.len() * 2;
-        let bin_width = self.sample_rate / fft_size as f32;
-        let bin_low = ((freq_low / bin_width).floor() as usize).min(self.fft.len() - 1);
-        let bin_high = ((freq_high / bin_width).ceil() as usize).min(self.fft.len());
-        if bin_high <= bin_low { return 0.0; }
-        let slice = &self.fft[bin_low..bin_high];
-        let rms = (slice.iter().map(|v| v * v).sum::<f32>() / slice.len() as f32).sqrt();
-        if rms < 1e-6 { return 0.0; }
-        let db = 20.0 * rms.log10();
-        ((db + 60.0) / 60.0).clamp(0.0, 1.0)
+        // Optimization: return pre-calculated standard bands if possible.
+        if (freq_low - 20.0).abs() < 0.1 {
+            if (freq_high - 250.0).abs() < 0.1 { return self.bass; }
+            if (freq_high - 20000.0).abs() < 0.1 { return self.full; }
+        } else if (freq_low - 250.0).abs() < 0.1 && (freq_high - 2000.0).abs() < 0.1 {
+            return self.mid;
+        } else if (freq_low - 2000.0).abs() < 0.1 && (freq_high - 20000.0).abs() < 0.1 {
+            return self.treble;
+        }
+
+        crate::audio::compute_energy_from_fft(&self.fft, self.sample_rate, freq_low, freq_high)
     }
 }
 
