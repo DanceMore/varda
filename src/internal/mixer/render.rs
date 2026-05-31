@@ -1,8 +1,8 @@
 //! Mixer render pipeline — compositing, master effects, sub-mixes.
 
+use super::{AutoCrossfade, CrossfadeEasing, Mixer};
 use crate::renderer::{GpuContext, ISFUniforms};
 use anyhow::Result;
-use super::{Mixer, CrossfadeEasing, AutoCrossfade};
 
 impl Mixer {
     /// Pre-update modulation engine with latest audio data.
@@ -12,12 +12,19 @@ impl Mixer {
     }
 
     /// Render all channels and composite them via crossfader, then apply master effects.
-    pub fn render(&mut self, context: &GpuContext, audio_data: &crate::audio::AudioData, audio_values: &crate::modulation::AudioValues) -> Result<()> {
+    pub fn render(
+        &mut self,
+        context: &GpuContext,
+        audio_data: &crate::audio::AudioData,
+        audio_values: &crate::modulation::AudioValues,
+    ) -> Result<()> {
         let now = std::time::Instant::now();
         // Clamp dt to a sane window: a startup spike or paused window can hand
         // us multi-second deltas that would blow up frame-rate-dependent
         // shader math. Floor at 1ms so divisions stay finite.
-        let dt = (now - self.last_render_time).as_secs_f32().clamp(0.001, 0.1);
+        let dt = (now - self.last_render_time)
+            .as_secs_f32()
+            .clamp(0.001, 0.1);
         self.last_render_time = now;
 
         // Tick auto-crossfade
@@ -41,11 +48,18 @@ impl Mixer {
                     let bpm = audio_data.bpm.unwrap_or(120.0);
                     let duration_secs = bsc.beats * 60.0 / bpm;
                     bsc.auto = Some(AutoCrossfade::new(
-                        self.crossfader, bsc.to, duration_secs, CrossfadeEasing::EaseInOut,
+                        self.crossfader,
+                        bsc.to,
+                        duration_secs,
+                        CrossfadeEasing::EaseInOut,
                     ));
                     bsc.started = true;
-                    log::info!("Beat-synced crossfade started: {:.1} beats at {:.0} BPM = {:.2}s",
-                        bsc.beats, bpm, duration_secs);
+                    log::info!(
+                        "Beat-synced crossfade started: {:.1} beats at {:.0} BPM = {:.2}s",
+                        bsc.beats,
+                        bpm,
+                        duration_secs
+                    );
                 }
             }
 
@@ -70,14 +84,21 @@ impl Mixer {
         let time = self.start_time.elapsed().as_secs_f32();
         self.modulation.update(time, audio_values);
 
-        // Compute effective opacity per channel
+        // Pre-calculate opacity weights once per frame. Both the main composite
+        // and any sub-mixes will use these cached values.
+        self.update_composite_opacities();
+
+        // Compute effective opacity per channel for culling
         let channel_count = self.channels.len();
         self.effective_opacities.clear();
         if channel_count == 2 {
-            self.effective_opacities.push((1.0 - self.crossfader) * self.channels[0].opacity);
-            self.effective_opacities.push(self.crossfader * self.channels[1].opacity);
+            self.effective_opacities
+                .push((1.0 - self.crossfader) * self.channels[0].opacity);
+            self.effective_opacities
+                .push(self.crossfader * self.channels[1].opacity);
         } else {
-            self.effective_opacities.extend(self.channels.iter().map(|ch| ch.opacity));
+            self.effective_opacities
+                .extend(self.channels.iter().map(|ch| ch.opacity));
         };
 
         // Always tick video frames on every channel so players stay in sync
@@ -93,7 +114,15 @@ impl Mixer {
             self.prev_culled.resize(self.channels.len(), false);
         }
 
-        let mut clear_cmds = Vec::new();
+        let mut all_cmds = Vec::new();
+        let mut clear_encoder =
+            context
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Mixer Culled Clear Encoder"),
+                });
+        let mut has_clears = false;
+
         for (ch_idx, channel) in self.channels.iter_mut().enumerate() {
             let is_culled = self.effective_opacities.get(ch_idx).copied().unwrap_or(0.0) < 0.001;
             let was_culled = self.prev_culled[ch_idx];
@@ -106,29 +135,34 @@ impl Mixer {
                 // black composite_view, and a channel that re-enters visibility
                 // overwrites it on its next render().
                 if !was_culled {
-                    clear_cmds.push(channel.clear_composite_cmd(context));
+                    channel.record_clear_composite(&mut clear_encoder);
+                    has_clears = true;
                 }
                 self.prev_culled[ch_idx] = true;
                 continue;
             }
             self.prev_culled[ch_idx] = false;
-            if let Err(e) = channel.render(context, audio_data, &self.modulation, ch_idx, time, dt) {
+            if let Err(e) = channel.render(context, audio_data, &self.modulation, ch_idx, time, dt)
+            {
                 log::error!("Channel {} render failed, skipping: {}", ch_idx, e);
                 continue;
             }
         }
-        if !clear_cmds.is_empty() {
-            context.queue.submit(clear_cmds);
+        if has_clears {
+            all_cmds.push(clear_encoder.finish());
         }
 
         self.sync_transition_progress();
-        self.composite_channels(context, dt)?;
-        self.apply_master_effects(context, audio_data, time, dt)?;
+        self.composite_channels(context, dt, &mut all_cmds)?;
+        self.apply_master_effects(context, audio_data, time, dt, &mut all_cmds)?;
+
+        if !all_cmds.is_empty() {
+            context.queue.submit(all_cmds);
+        }
 
         self.frame_count += 1;
         Ok(())
     }
-
 
     /// Per-channel opacity weights for the opacity-based composite passes.
     ///
@@ -152,16 +186,25 @@ impl Mixer {
             self.composite_opacities.push(a_copy_opacity);
             self.composite_opacities.push(b_weight);
         } else {
-            self.composite_opacities.extend(self.channels.iter().map(|ch| ch.opacity));
+            self.composite_opacities
+                .extend(self.channels.iter().map(|ch| ch.opacity));
         }
     }
 
-    fn composite_channels(&mut self, context: &GpuContext, dt: f32) -> Result<()> {
+    fn composite_channels(
+        &mut self,
+        context: &GpuContext,
+        dt: f32,
+        all_cmds: &mut Vec<wgpu::CommandBuffer>,
+    ) -> Result<()> {
         let channel_count = self.channels.len();
         if channel_count == 0 {
-            let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Mixer Clear Encoder"),
-            });
+            let mut encoder =
+                context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Mixer Clear Encoder"),
+                    });
             {
                 let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Mixer Clear Pass"),
@@ -179,7 +222,7 @@ impl Mixer {
                     occlusion_query_set: None,
                 });
             }
-            context.queue.submit(std::iter::once(encoder.finish()));
+            all_cmds.push(encoder.finish());
             return Ok(());
         }
 
@@ -204,14 +247,14 @@ impl Mixer {
                     context.queue.write_buffer(buf, 0, &params_data);
                 }
 
-                transition.pipeline.render_to(
+                all_cmds.push(transition.pipeline.render_to_cmd(
                     context,
                     self.channels[0].composite_view(),
                     self.channels[1].composite_view(),
                     self.composite.target_view(),
                     &uniforms,
                     transition.params.buffer(),
-                );
+                ));
                 self.composite.advance();
 
                 return Ok(());
@@ -220,30 +263,6 @@ impl Mixer {
 
         // Fallback: opacity-based crossfade
         //
-        // For 2-channel mode the first channel is blitted onto a cleared-to-black
-        // target using ALPHA_BLENDING.  The hardware blend applies SrcAlpha to the
-        // RGB output, so if the blit shader also multiplies alpha by opacity, the
-        // effective weight becomes opacity² (double-application).
-        //
-        // To avoid this, channel B's effective crossfade weight is used as the
-        // second channel's composite opacity. Channel A is pre-scaled so that,
-        // after the second pass attenuates the destination by (1 - b), the final
-        // result is still the requested linear mix:
-        //     ((1-cf)·opacityA)·A + (cf·opacityB)·B.
-        self.update_composite_opacities();
-
-        // Composite channels via ping-pong: the first visible channel blits into
-        // the target; each subsequent channel blends over the composite-so-far
-        // (background_view) into the fresh target, then advance(). No snapshot copy.
-        //
-        // Bind groups are rebuilt per frame rather than cached by channel index:
-        // ping-pong alternates the physical target/background each step, and a
-        // channel's own output texture identity can change between frames, so a
-        // cache keyed by index can't stay valid. The N-1 full-screen GPU copies
-        // this eliminates dwarf the per-frame bind-group rebuild cost.
-        //
-        // Submit per-channel to ensure each channel's uniform buffer writes
-        // are consumed before the next channel overwrites them.
         // Composite channels via ping-pong: the first visible channel blits into
         // the target; each subsequent channel blends over the composite-so-far
         // (background_view) into the fresh target, then advance(). No snapshot copy.
@@ -251,19 +270,25 @@ impl Mixer {
         // We use dynamic offsets and a single CommandEncoder to batch all
         // compositing steps into a single GPU submission, eliminating CPU overhead.
         let mut is_first = true;
-        let mut composite_cmds = Vec::new();
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Mixer Composite Encoder"),
+            });
 
         for i in 0..self.channels.len() {
             let opacity = self.composite_opacities[i];
-            if opacity <= 0.0 { continue; }
+            if opacity <= 0.0 {
+                continue;
+            }
 
             if is_first {
                 // First visible channel: simple blit copy into the ping-pong target
-                self.blit_pipeline.set_opacity_at_slot(&context.queue, opacity, i);
-                let bind_group = self.blit_pipeline.create_bind_group(&context.device, self.channels[i].composite_view());
-                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Mixer Composite Encoder (first)"),
-                });
+                self.blit_pipeline
+                    .set_opacity_at_slot(&context.queue, opacity, i);
+                let bind_group = self
+                    .blit_pipeline
+                    .create_bind_group(&context.device, self.channels[i].composite_view());
                 {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Mixer Composite Pass (first)"),
@@ -280,23 +305,27 @@ impl Mixer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.blit_pipeline.render_with_slot(&mut render_pass, &bind_group, i);
+                    self.blit_pipeline
+                        .render_with_slot(&mut render_pass, &bind_group, i);
                 }
-                composite_cmds.push(encoder.finish());
                 self.composite.advance();
                 is_first = false;
             } else {
                 // Subsequent channels: blend channel + background → target (no snapshot)
                 let blend_mode = self.channels[i].blend_mode;
-                self.composite_pipeline.set_params_at_slot(&context.queue, opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0], i);
+                self.composite_pipeline.set_params_at_slot(
+                    &context.queue,
+                    opacity,
+                    blend_mode.to_index(),
+                    [1.0, 1.0],
+                    [0.0, 0.0],
+                    i,
+                );
                 let bind_group = self.composite_pipeline.create_bind_group(
                     &context.device,
                     self.channels[i].composite_view(),
                     self.composite.background_view(),
                 );
-                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Mixer Composite Encoder"),
-                });
                 {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Mixer Composite Pass"),
@@ -313,25 +342,28 @@ impl Mixer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.composite_pipeline.render_with_slot(&mut render_pass, &bind_group, i);
+                    self.composite_pipeline
+                        .render_with_slot(&mut render_pass, &bind_group, i);
                 }
-                composite_cmds.push(encoder.finish());
                 self.composite.advance();
             }
         }
 
-        if !composite_cmds.is_empty() {
-            context.queue.submit(composite_cmds);
-        }
-
+        all_cmds.push(encoder.finish());
         Ok(())
     }
 
     /// Prepare sub-mix textures for all unique multi-channel surface sources.
-    pub fn prepare_sub_mixes(&mut self, sources: &[Vec<usize>], context: &GpuContext) {
+    pub fn prepare_sub_mixes(
+        &mut self,
+        sources: &[Vec<usize>],
+        context: &GpuContext,
+        all_cmds: &mut Vec<wgpu::CommandBuffer>,
+    ) {
         let needed: std::collections::HashSet<Vec<usize>> = sources.iter().cloned().collect();
         self.sub_mix_cache.retain(|k, _| needed.contains(k));
 
+        let mut slot_offset = 0;
         for mut indices in sources.iter().cloned() {
             indices.sort();
             indices.dedup();
@@ -342,23 +374,27 @@ impl Mixer {
                 let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
                 let scratch_tex = context.create_render_texture(width, height);
                 let scratch_view = scratch_tex.create_view(&wgpu::TextureViewDescriptor::default());
-                self.sub_mix_cache.insert(indices.clone(), (tex, view, scratch_tex, scratch_view));
+                self.sub_mix_cache
+                    .insert(indices.clone(), (tex, view, scratch_tex, scratch_view));
             }
-            self.composite_sub_mix(&indices, context);
+            self.composite_sub_mix(&indices, context, all_cmds, &mut slot_offset);
         }
     }
 
     /// Composite a specific subset of channels into the cached sub-mix texture.
-    fn composite_sub_mix(&mut self, indices: &[usize], context: &GpuContext) {
+    fn composite_sub_mix(
+        &mut self,
+        indices: &[usize],
+        context: &GpuContext,
+        all_cmds: &mut Vec<wgpu::CommandBuffer>,
+        slot_offset: &mut usize,
+    ) {
         if !self.sub_mix_cache.contains_key(indices) {
             return;
         }
 
-        // Same linear-crossfade formula as composite_channels — share the helper
-        // so sub-mixes get the corrected opacity-compensation math.
-        self.update_composite_opacities();
-
-        let (_sub_tex, sub_view, _scratch_tex, scratch_view) = match self.sub_mix_cache.get(indices) {
+        let (_sub_tex, sub_view, _scratch_tex, scratch_view) = match self.sub_mix_cache.get(indices)
+        {
             Some(entry) => entry,
             None => return,
         };
@@ -366,16 +402,24 @@ impl Mixer {
         // Collect visible channels in this sub-mix.
         self.sub_mix_visible.clear();
         for &ch_idx in indices {
-            if ch_idx >= self.channels.len() { continue; }
+            if ch_idx >= self.channels.len() {
+                continue;
+            }
             let opacity = self.composite_opacities[ch_idx];
-            if opacity <= 0.0 { continue; }
-            self.sub_mix_visible.push(super::SubMixInfo { ch_idx, opacity });
+            if opacity <= 0.0 {
+                continue;
+            }
+            self.sub_mix_visible
+                .push(super::SubMixInfo { ch_idx, opacity });
         }
 
         if self.sub_mix_visible.is_empty() {
-            let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Sub-mix Clear Encoder"),
-            });
+            let mut encoder =
+                context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Sub-mix Clear Encoder"),
+                    });
             {
                 let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Sub-mix Clear Pass"),
@@ -393,7 +437,7 @@ impl Mixer {
                     occlusion_query_set: None,
                 });
             }
-            context.queue.submit(std::iter::once(encoder.finish()));
+            all_cmds.push(encoder.finish());
             return;
         }
 
@@ -403,25 +447,38 @@ impl Mixer {
         // result always lands in `sub_view` without any intermediate full-screen
         // GPU snapshot copies.
         //
-        // We use dynamic offsets and a single queue submission to batch the sub-mix stack.
+        // We use dynamic offsets and a single CommandEncoder to batch the sub-mix stack.
         let n = self.sub_mix_visible.len();
-        let mut sub_mix_cmds = Vec::with_capacity(n);
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Sub-mix Composite Encoder"),
+            });
 
         for i in 0..n {
             let info = self.sub_mix_visible[i];
             let channel = &self.channels[info.ch_idx];
 
             // Parity: we want the final step (i = n-1) to land in sub_view.
-            let target = if (n - 1 - i) % 2 == 0 { sub_view } else { scratch_view };
-            let background = if (n - 1 - i) % 2 == 0 { scratch_view } else { sub_view };
+            let target = if (n - 1 - i) % 2 == 0 {
+                sub_view
+            } else {
+                scratch_view
+            };
+            let background = if (n - 1 - i) % 2 == 0 {
+                scratch_view
+            } else {
+                sub_view
+            };
 
+            let current_slot = *slot_offset + i;
             if i == 0 {
                 // First visible channel: simple blit copy into the selected target
-                self.blit_pipeline.set_opacity_at_slot(&context.queue, info.opacity, i);
-                let bind_group = self.blit_pipeline.create_bind_group(&context.device, channel.composite_view());
-                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Sub-mix Composite Encoder (first)"),
-                });
+                self.blit_pipeline
+                    .set_opacity_at_slot(&context.queue, info.opacity, current_slot);
+                let bind_group = self
+                    .blit_pipeline
+                    .create_bind_group(&context.device, channel.composite_view());
                 {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Sub-mix Composite Pass (first)"),
@@ -438,21 +495,28 @@ impl Mixer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.blit_pipeline.render_with_slot(&mut render_pass, &bind_group, i);
+                    self.blit_pipeline.render_with_slot(
+                        &mut render_pass,
+                        &bind_group,
+                        current_slot,
+                    );
                 }
-                sub_mix_cmds.push(encoder.finish());
             } else {
                 // Subsequent channels: blend channel + background → target (no snapshot)
                 let blend_mode = channel.blend_mode;
-                self.composite_pipeline.set_params_at_slot(&context.queue, info.opacity, blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0], i);
+                self.composite_pipeline.set_params_at_slot(
+                    &context.queue,
+                    info.opacity,
+                    blend_mode.to_index(),
+                    [1.0, 1.0],
+                    [0.0, 0.0],
+                    current_slot,
+                );
                 let bind_group = self.composite_pipeline.create_bind_group(
                     &context.device,
                     channel.composite_view(),
                     background,
                 );
-                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Sub-mix Composite Encoder"),
-                });
                 {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Sub-mix Composite Pass"),
@@ -469,14 +533,16 @@ impl Mixer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.composite_pipeline.render_with_slot(&mut render_pass, &bind_group, i);
+                    self.composite_pipeline.render_with_slot(
+                        &mut render_pass,
+                        &bind_group,
+                        current_slot,
+                    );
                 }
-                sub_mix_cmds.push(encoder.finish());
             }
         }
-        if !sub_mix_cmds.is_empty() {
-            context.queue.submit(sub_mix_cmds);
-        }
+        *slot_offset += n;
+        all_cmds.push(encoder.finish());
     }
 
     /// Get the sub-mix texture view for a given set of channel indices.
@@ -484,8 +550,14 @@ impl Mixer {
         self.sub_mix_cache.get(indices).map(|(_, v, _, _)| v)
     }
 
-
-    fn apply_master_effects(&mut self, context: &GpuContext, audio_data: &crate::audio::AudioData, time: f32, dt: f32) -> Result<()> {
+    fn apply_master_effects(
+        &mut self,
+        context: &GpuContext,
+        audio_data: &crate::audio::AudioData,
+        time: f32,
+        dt: f32,
+        all_cmds: &mut Vec<wgpu::CommandBuffer>,
+    ) -> Result<()> {
         if self.master_effects.is_empty() {
             return Ok(());
         }
@@ -509,24 +581,20 @@ impl Mixer {
             phase_times: [0.0; 4],
         };
 
-        let mut cmd_buffers: Vec<wgpu::CommandBuffer> = Vec::new();
-
         for effect in self.master_effects.iter_mut() {
-            if !effect.enabled { continue; }
+            if !effect.enabled {
+                continue;
+            }
 
             // Ping-pong: read composite-so-far from background, write to target.
             let input_view = self.composite.background_view();
             let output_view = self.composite.target_view();
 
-            effect.apply(context, input_view, output_view, &uniforms, &mut cmd_buffers)?;
+            effect.apply(context, input_view, output_view, &uniforms, all_cmds)?;
             self.composite.advance();
         }
 
         // No final copy needed: result_view() always holds the latest content.
-
-        if !cmd_buffers.is_empty() {
-            context.queue.submit(cmd_buffers);
-        }
 
         Ok(())
     }

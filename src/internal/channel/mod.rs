@@ -4,11 +4,24 @@ use crate::deck::{Deck, Effect};
 use crate::isf::ISFShader;
 use crate::modulation::ModulationEngine;
 use crate::params::ShaderParams;
-use crate::renderer::{GpuContext, BlitPipeline, CompositeBlitPipeline, ISFUniforms, TransitionPipeline, PingPong};
+use crate::renderer::{
+    BlitPipeline, CompositeBlitPipeline, GpuContext, ISFUniforms, PingPong, TransitionPipeline,
+};
 use anyhow::{Context as _, Result};
 
 /// Blend modes for compositing decks and channels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 pub enum BlendMode {
     #[default]
     Normal,
@@ -97,7 +110,9 @@ impl BlendMode {
 // ── Auto-Transition Types ──────────────────────────────────────────
 
 /// Unit of a duration value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 pub enum DurationUnit {
     Seconds,
     Minutes,
@@ -156,11 +171,16 @@ impl DurationSpec {
     /// Get the raw numeric value.
     pub fn value(&self) -> f64 {
         match self {
-            DurationSpec::Beats(v) | DurationSpec::Seconds(v) | DurationSpec::Minutes(v) | DurationSpec::Hours(v) => *v,
+            DurationSpec::Beats(v)
+            | DurationSpec::Seconds(v)
+            | DurationSpec::Minutes(v)
+            | DurationSpec::Hours(v) => *v,
         }
     }
 
-    pub fn is_beats(&self) -> bool { matches!(self, DurationSpec::Beats(_)) }
+    pub fn is_beats(&self) -> bool {
+        matches!(self, DurationSpec::Beats(_))
+    }
 
     /// Get the unit of this duration.
     pub fn unit(&self) -> DurationUnit {
@@ -280,20 +300,17 @@ impl DeckSlot {
 
     /// Set the transition shader for this deck's auto-transition.
     /// Compiles the shader and stores the pipeline.
-    pub fn set_transition_shader(
-        &mut self,
-        context: &GpuContext,
-        shader: ISFShader,
-    ) -> Result<()> {
+    pub fn set_transition_shader(&mut self, context: &GpuContext, shader: ISFShader) -> Result<()> {
         let spirv = crate::isf::compile_glsl_to_spirv(&shader.fragment_source, &shader.name())
             .context("Failed to compile transition shader to SPIR-V")?;
-        let pipeline = TransitionPipeline::new(
-            &context.device,
-            &spirv,
-            context.texture_format,
-        )?;
+        let pipeline = TransitionPipeline::new(&context.device, &spirv, context.texture_format)?;
         let name = shader.name();
-        let inputs = shader.metadata.inputs.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+        let inputs = shader
+            .metadata
+            .inputs
+            .as_ref()
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let mut params = ShaderParams::from_inputs(inputs);
         params.ensure_buffer(&context.device);
 
@@ -305,7 +322,11 @@ impl DeckSlot {
             at.transition_shader_name = Some(name);
         }
 
-        self.transition_effect = Some(DeckTransitionEffect { shader, pipeline, params });
+        self.transition_effect = Some(DeckTransitionEffect {
+            shader,
+            pipeline,
+            params,
+        });
         Ok(())
     }
 
@@ -319,7 +340,8 @@ impl DeckSlot {
 
     /// Get the current auto-transition phase.
     pub fn transition_phase(&self) -> DeckTransitionPhase {
-        self.auto_transition.as_ref()
+        self.auto_transition
+            .as_ref()
             .filter(|at| at.enabled)
             .map(|at| at.phase)
             .unwrap_or(DeckTransitionPhase::Inactive)
@@ -415,7 +437,8 @@ impl Channel {
     pub fn new(name: String, context: &GpuContext, width: u32, height: u32) -> Result<Self> {
         let composite = PingPong::new(context, width, height);
 
-        let composite_pipeline = CompositeBlitPipeline::new(&context.device, context.texture_format)?;
+        let composite_pipeline =
+            CompositeBlitPipeline::new(&context.device, context.texture_format)?;
         let blit_pipeline = BlitPipeline::with_blend(
             &context.device,
             context.texture_format,
@@ -489,31 +512,25 @@ impl Channel {
         }
     }
 
-    /// Clear the channel composite texture when the channel is culled from the
-    /// mixer. This prevents stale content from a previous visible frame being
-    /// sampled by crossfade or transition paths that still read channel views.
-    pub fn clear_composite_cmd(&self, context: &GpuContext) -> wgpu::CommandBuffer {
-        let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Channel Culled Clear Encoder"),
+    /// Record a clear of the channel composite texture into the provided encoder.
+    /// Called when the channel is culled from the mixer to prevent stale content
+    /// from being sampled by crossfade or transition paths.
+    pub fn record_clear_composite(&self, encoder: &mut wgpu::CommandEncoder) {
+        let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Channel Culled Clear Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: self.composite.result_view(),
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
         });
-        {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Channel Culled Clear Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: self.composite.result_view(),
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-        }
-        encoder.finish()
     }
 
     /// Render all decks in this channel and composite them, then apply channel effects
@@ -562,7 +579,13 @@ impl Channel {
                 // alternative is plumbing a separate borrow path. This clone
                 // happens once per visible deck per frame.
                 let param_prefix = slot.deck.mod_prefix.clone();
-                slot.deck.render_with_prefix(context, audio_data, modulation, &param_prefix, &mut frame_cmds)?;
+                slot.deck.render_with_prefix(
+                    context,
+                    audio_data,
+                    modulation,
+                    &param_prefix,
+                    &mut frame_cmds,
+                )?;
             }
         }
         self.active_deck_count = active_count;
@@ -580,7 +603,10 @@ impl Channel {
                 // Inactive = waiting for turn. Done = already played, no longer needed
                 // (the next deck in sequence gets re-activated to Playing when needed).
                 let has_at = slot.auto_transition.as_ref().map_or(false, |at| at.enabled);
-                if has_at && (phase == DeckTransitionPhase::Inactive || phase == DeckTransitionPhase::Done) {
+                if has_at
+                    && (phase == DeckTransitionPhase::Inactive
+                        || phase == DeckTransitionPhase::Done)
+                {
                     continue;
                 }
                 let transition_progress = match phase {
@@ -618,7 +644,9 @@ impl Channel {
             if info.transition_progress.is_some() {
                 continue;
             }
-            if let Some(cmd) = self.render_composite_step(context, &info, composite_step, time, dt, width, height)? {
+            if let Some(cmd) =
+                self.render_composite_step(context, &info, composite_step, time, dt, width, height)?
+            {
                 frame_cmds.push(cmd);
             }
             composite_step += 1;
@@ -631,7 +659,9 @@ impl Channel {
             if info.transition_progress.is_none() {
                 continue;
             }
-            if let Some(cmd) = self.render_composite_step(context, &info, composite_step, time, dt, width, height)? {
+            if let Some(cmd) =
+                self.render_composite_step(context, &info, composite_step, time, dt, width, height)?
+            {
                 frame_cmds.push(cmd);
             }
             composite_step += 1;
@@ -639,9 +669,12 @@ impl Channel {
 
         // If no decks, clear the composite texture to transparent
         if self.composite_info.is_empty() {
-            let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Channel Clear Encoder"),
-            });
+            let mut encoder =
+                context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Channel Clear Encoder"),
+                    });
             {
                 let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Channel Clear Pass"),
@@ -698,7 +731,15 @@ impl Channel {
                 // needed because effect is borrowed mutably below via
                 // apply_with_modulation.
                 let fx_prefix = effect.mod_prefix.clone();
-                if let Err(e) = effect.apply_with_modulation(context, input_view, output_view, &uniforms, Some(modulation), Some(&fx_prefix), &mut frame_cmds) {
+                if let Err(e) = effect.apply_with_modulation(
+                    context,
+                    input_view,
+                    output_view,
+                    &uniforms,
+                    Some(modulation),
+                    Some(&fx_prefix),
+                    &mut frame_cmds,
+                ) {
                     log::warn!("Effect {} failed, skipping: {}", _eff_idx, e);
                     continue;
                 }
@@ -750,7 +791,10 @@ impl Channel {
                 };
 
                 // Set progress on the transition shader
-                effect.params.set("progress", crate::params::ParamValue::Float(progress as f32));
+                effect.params.set(
+                    "progress",
+                    crate::params::ParamValue::Float(progress as f32),
+                );
                 let params_data = effect.params.build_buffer_data();
                 if let Some(buf) = effect.params.buffer() {
                     context.queue.write_buffer(buf, 0, &params_data);
@@ -758,9 +802,9 @@ impl Channel {
 
                 let cmd = effect.pipeline.render_to_cmd(
                     context,
-                    &slot.deck.texture_view,            // startImage: outgoing deck
-                    self.composite.background_view(),   // endImage: composite below
-                    self.composite.target_view(),       // output: ping-pong target
+                    &slot.deck.texture_view, // startImage: outgoing deck
+                    self.composite.background_view(), // endImage: composite below
+                    self.composite.target_view(), // output: ping-pong target
                     &uniforms,
                     effect.params.buffer(),
                 );
@@ -772,11 +816,17 @@ impl Channel {
             let fade_opacity = info.opacity * (1.0 - progress as f32);
             if step_idx == 0 {
                 // First deck: simple blit with alpha blending
-                self.blit_pipeline.set_opacity_at_slot(&context.queue, fade_opacity, step_idx);
-                let bind_group = self.blit_pipeline.create_bind_group(&context.device, &slot.deck.texture_view);
-                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Channel Composite Encoder (AT fade first)"),
-                });
+                self.blit_pipeline
+                    .set_opacity_at_slot(&context.queue, fade_opacity, step_idx);
+                let bind_group = self
+                    .blit_pipeline
+                    .create_bind_group(&context.device, &slot.deck.texture_view);
+                let mut encoder =
+                    context
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Channel Composite Encoder (AT fade first)"),
+                        });
                 {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Channel Composite Pass (AT fade first)"),
@@ -793,17 +843,32 @@ impl Channel {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.blit_pipeline.render_with_slot(&mut render_pass, &bind_group, step_idx);
+                    self.blit_pipeline
+                        .render_with_slot(&mut render_pass, &bind_group, step_idx);
                 }
                 self.composite.advance();
                 return Ok(Some(encoder.finish()));
             } else {
                 // Subsequent decks: blend deck + background → target (no snapshot)
-                self.composite_pipeline.set_params_at_slot(&context.queue, fade_opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0], step_idx);
-                let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, self.composite.background_view());
-                let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Channel Composite Encoder (AT fade)"),
-                });
+                self.composite_pipeline.set_params_at_slot(
+                    &context.queue,
+                    fade_opacity,
+                    info.blend_mode.to_index(),
+                    [1.0, 1.0],
+                    [0.0, 0.0],
+                    step_idx,
+                );
+                let bind_group = self.composite_pipeline.create_bind_group(
+                    &context.device,
+                    &slot.deck.texture_view,
+                    self.composite.background_view(),
+                );
+                let mut encoder =
+                    context
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Channel Composite Encoder (AT fade)"),
+                        });
                 {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Channel Composite Pass (AT fade)"),
@@ -820,7 +885,11 @@ impl Channel {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.composite_pipeline.render_with_slot(&mut render_pass, &bind_group, step_idx);
+                    self.composite_pipeline.render_with_slot(
+                        &mut render_pass,
+                        &bind_group,
+                        step_idx,
+                    );
                 }
                 self.composite.advance();
                 return Ok(Some(encoder.finish()));
@@ -830,11 +899,17 @@ impl Channel {
         // Normal compositing
         if step_idx == 0 {
             // First deck: simple blit with alpha blending (Normal = just copy)
-            self.blit_pipeline.set_opacity_at_slot(&context.queue, info.opacity, step_idx);
-            let bind_group = self.blit_pipeline.create_bind_group(&context.device, &slot.deck.texture_view);
-            let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Channel Composite Encoder (first)"),
-            });
+            self.blit_pipeline
+                .set_opacity_at_slot(&context.queue, info.opacity, step_idx);
+            let bind_group = self
+                .blit_pipeline
+                .create_bind_group(&context.device, &slot.deck.texture_view);
+            let mut encoder =
+                context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Channel Composite Encoder (first)"),
+                    });
             {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Channel Composite Pass (first)"),
@@ -851,17 +926,32 @@ impl Channel {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                self.blit_pipeline.render_with_slot(&mut render_pass, &bind_group, step_idx);
+                self.blit_pipeline
+                    .render_with_slot(&mut render_pass, &bind_group, step_idx);
             }
             self.composite.advance();
             Ok(Some(encoder.finish()))
         } else {
             // Subsequent decks: blend src + background → target (no snapshot)
-            self.composite_pipeline.set_params_at_slot(&context.queue, info.opacity, info.blend_mode.to_index(), [1.0, 1.0], [0.0, 0.0], step_idx);
-            let bind_group = self.composite_pipeline.create_bind_group(&context.device, &slot.deck.texture_view, self.composite.background_view());
-            let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Channel Composite Encoder"),
-            });
+            self.composite_pipeline.set_params_at_slot(
+                &context.queue,
+                info.opacity,
+                info.blend_mode.to_index(),
+                [1.0, 1.0],
+                [0.0, 0.0],
+                step_idx,
+            );
+            let bind_group = self.composite_pipeline.create_bind_group(
+                &context.device,
+                &slot.deck.texture_view,
+                self.composite.background_view(),
+            );
+            let mut encoder =
+                context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Channel Composite Encoder"),
+                    });
             {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Channel Composite Pass"),
@@ -878,7 +968,8 @@ impl Channel {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                self.composite_pipeline.render_with_slot(&mut render_pass, &bind_group, step_idx);
+                self.composite_pipeline
+                    .render_with_slot(&mut render_pass, &bind_group, step_idx);
             }
             self.composite.advance();
             Ok(Some(encoder.finish()))
@@ -933,7 +1024,11 @@ impl Channel {
     /// Set deck opacity
     pub fn set_deck_opacity(&mut self, index: usize, opacity: f32) {
         if let Some(slot) = self.decks.get_mut(index) {
-            slot.opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
+            slot.opacity = if opacity.is_finite() {
+                opacity.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
         }
     }
 
@@ -966,7 +1061,8 @@ impl Channel {
         // Sort by z-index descending to find the top deck.
         self.deck_indices.clear();
         self.deck_indices.extend(0..self.decks.len());
-        self.deck_indices.sort_by_key(|&i| std::cmp::Reverse(self.decks[i].z_index));
+        self.deck_indices
+            .sort_by_key(|&i| std::cmp::Reverse(self.decks[i].z_index));
 
         // Find the topmost deck that is visible and has auto-transition enabled
         let active_idx = self.deck_indices.iter().copied().find(|&i| {
@@ -1002,10 +1098,13 @@ impl Channel {
                         TransitionTrigger::Timer => *elapsed >= play_secs,
                         TransitionTrigger::ClipEnd => {
                             // Check if video reached end
-                            let clip_ended = slot.deck.playback_state()
+                            let clip_ended = slot
+                                .deck
+                                .playback_state()
                                 .map_or(false, |ps| ps.reached_end);
                             // Also respect timer as fallback for non-video sources
-                            clip_ended || (slot.deck.playback_state().is_none() && *elapsed >= play_secs)
+                            clip_ended
+                                || (slot.deck.playback_state().is_none() && *elapsed >= play_secs)
                         }
                     };
 
@@ -1039,8 +1138,9 @@ impl Channel {
             // Try Inactive first
             for j in 0..self.decks.len() {
                 let slot = &self.decks[j];
-                let is_candidate = slot.auto_transition.as_ref()
-                    .map_or(false, |at| at.enabled && at.phase == DeckTransitionPhase::Inactive);
+                let is_candidate = slot.auto_transition.as_ref().map_or(false, |at| {
+                    at.enabled && at.phase == DeckTransitionPhase::Inactive
+                });
                 if is_candidate && !slot.mute {
                     if let Some(at) = self.decks[j].auto_transition.as_mut() {
                         at.phase = DeckTransitionPhase::Playing { elapsed: 0.0 };
@@ -1053,8 +1153,9 @@ impl Channel {
             if !activated {
                 for j in 0..self.decks.len() {
                     let slot = &self.decks[j];
-                    let is_candidate = slot.auto_transition.as_ref()
-                        .map_or(false, |at| at.enabled && at.phase == DeckTransitionPhase::Done);
+                    let is_candidate = slot.auto_transition.as_ref().map_or(false, |at| {
+                        at.enabled && at.phase == DeckTransitionPhase::Done
+                    });
                     if is_candidate && !slot.mute {
                         if let Some(at) = self.decks[j].auto_transition.as_mut() {
                             at.phase = DeckTransitionPhase::Playing { elapsed: 0.0 };
@@ -1068,15 +1169,14 @@ impl Channel {
         // Check if all auto-transition decks are now Done → loop reset.
         // Done AFTER phase updates so the reset happens in the same frame
         // a deck transitions to Done, preventing a flash of stale content.
-        let all_done = self.decks.iter().all(|slot| {
-            match &slot.auto_transition {
-                Some(at) if at.enabled => at.phase == DeckTransitionPhase::Done,
-                _ => true,
-            }
+        let all_done = self.decks.iter().all(|slot| match &slot.auto_transition {
+            Some(at) if at.enabled => at.phase == DeckTransitionPhase::Done,
+            _ => true,
         });
-        let any_at = self.decks.iter().any(|slot| {
-            slot.auto_transition.as_ref().map_or(false, |at| at.enabled)
-        });
+        let any_at = self
+            .decks
+            .iter()
+            .any(|slot| slot.auto_transition.as_ref().map_or(false, |at| at.enabled));
 
         if all_done && any_at {
             // Reset all AT decks to Inactive, then immediately activate the first one
@@ -1089,8 +1189,9 @@ impl Channel {
             }
             for slot in &mut self.decks {
                 let dominated = slot.mute;
-                let is_inactive_at = slot.auto_transition.as_ref()
-                    .map_or(false, |at| at.enabled && at.phase == DeckTransitionPhase::Inactive);
+                let is_inactive_at = slot.auto_transition.as_ref().map_or(false, |at| {
+                    at.enabled && at.phase == DeckTransitionPhase::Inactive
+                });
                 if is_inactive_at && !dominated {
                     if let Some(at) = slot.auto_transition.as_mut() {
                         at.phase = DeckTransitionPhase::Playing { elapsed: 0.0 };
@@ -1284,8 +1385,8 @@ mod tests {
     }
 
     fn add_solid_deck(ch: &mut Channel, gpu: &GpuContext, color: [f32; 4]) {
-        let deck = crate::deck::Deck::new_solid_color(gpu, color, 64, 64)
-            .expect("solid color deck");
+        let deck =
+            crate::deck::Deck::new_solid_color(gpu, color, 64, 64).expect("solid color deck");
         ch.add_deck(deck);
     }
 
@@ -1428,7 +1529,8 @@ mod tests {
 
         let audio = crate::audio::AudioData::default();
         let modulation = crate::modulation::ModulationEngine::new();
-        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0).unwrap();
+        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0)
+            .unwrap();
 
         // After one render, render_time_ms should be > 0 (something was measured)
         assert!(ch.render_time_ms > 0.0);
@@ -1446,7 +1548,8 @@ mod tests {
 
         let audio = crate::audio::AudioData::default();
         let modulation = crate::modulation::ModulationEngine::new();
-        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0).unwrap();
+        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0)
+            .unwrap();
 
         assert_eq!(ch.active_deck_count, 1);
     }
@@ -1461,7 +1564,8 @@ mod tests {
 
         let audio = crate::audio::AudioData::default();
         let modulation = crate::modulation::ModulationEngine::new();
-        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0).unwrap();
+        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0)
+            .unwrap();
 
         assert_eq!(ch.active_deck_count, 1);
     }
@@ -1477,13 +1581,15 @@ mod tests {
 
         // Render multiple frames — EMA should converge
         for _ in 0..10 {
-            ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0).unwrap();
+            ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0)
+                .unwrap();
         }
         let time_after_10 = ch.render_time_ms;
 
         // Render more frames
         for _ in 0..10 {
-            ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0).unwrap();
+            ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0)
+                .unwrap();
         }
         let time_after_20 = ch.render_time_ms;
 
@@ -1500,7 +1606,8 @@ mod tests {
 
         let audio = crate::audio::AudioData::default();
         let modulation = crate::modulation::ModulationEngine::new();
-        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0).unwrap();
+        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0)
+            .unwrap();
 
         // Time should be >= 0 (even empty channels do some work)
         assert!(ch.render_time_ms >= 0.0);
@@ -1527,11 +1634,16 @@ mod tests {
 
         // Render several frames so EMA has time to converge
         for _ in 0..5 {
-            ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0).unwrap();
+            ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0)
+                .unwrap();
         }
 
         let deck_fps = ch.decks[0].deck.fps();
-        assert!(deck_fps > 0.0, "Deck FPS should be positive after rendering, got {}", deck_fps);
+        assert!(
+            deck_fps > 0.0,
+            "Deck FPS should be positive after rendering, got {}",
+            deck_fps
+        );
     }
 
     #[test]
@@ -1545,11 +1657,16 @@ mod tests {
 
         // First render — time_delta may be very large (time since Deck creation)
         // but the guard (time_delta < 1.0) should keep FPS sane
-        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0).unwrap();
+        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0)
+            .unwrap();
         let fps = ch.decks[0].deck.fps();
         // Either 0 (if first delta was >= 1s) or some reasonable value
         assert!(fps >= 0.0);
-        assert!(fps < 100_000.0, "FPS should not be absurdly high, got {}", fps);
+        assert!(
+            fps < 100_000.0,
+            "FPS should not be absurdly high, got {}",
+            fps
+        );
     }
 
     #[test]
@@ -1563,7 +1680,8 @@ mod tests {
         let modulation = crate::modulation::ModulationEngine::new();
 
         for _ in 0..5 {
-            ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0).unwrap();
+            ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0)
+                .unwrap();
         }
 
         // Both decks should have positive FPS
@@ -1584,13 +1702,15 @@ mod tests {
 
         // Render to establish FPS
         for _ in 0..5 {
-            ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0).unwrap();
+            ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0)
+                .unwrap();
         }
         let fps_before = ch.decks[0].deck.fps();
 
         // Mute the deck — it won't render
         ch.decks[0].mute = true;
-        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0).unwrap();
+        ch.render(&gpu, &audio, &modulation, 0, 0.0, 1.0 / 60.0)
+            .unwrap();
 
         // FPS should remain unchanged (deck wasn't rendered, no EMA update)
         let fps_after = ch.decks[0].deck.fps();
