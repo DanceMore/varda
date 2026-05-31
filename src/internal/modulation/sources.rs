@@ -1,6 +1,7 @@
 //! Modulation source types and their computation logic.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use super::{LFOWaveform, AudioReactMode, ADSRStage, StepInterpolation, AudioBandPreset, AudioValues};
 
 fn default_noise_gate() -> f32 { 0.1 }
@@ -45,7 +46,7 @@ pub enum ModulationSource {
     },
     /// Step sequencer
     StepSequencer {
-        steps: Vec<f32>,
+        steps: Arc<[f32]>,
         rate: f32,
         interpolation: StepInterpolation,
         bipolar: bool,
@@ -100,7 +101,7 @@ impl ModulationSource {
 
     pub fn step_sequencer(num_steps: usize, rate: f32) -> Self {
         ModulationSource::StepSequencer {
-            steps: vec![0.0; num_steps.max(2)], rate,
+            steps: Arc::from(vec![0.0; num_steps.max(2)]), rate,
             interpolation: StepInterpolation::None, bipolar: false,
         }
     }

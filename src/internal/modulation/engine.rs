@@ -23,8 +23,6 @@ pub struct ModulationEngine {
     #[serde(skip)]
     uuid_to_idx: HashMap<String, usize>,
     #[serde(skip)]
-    prev_values: Vec<f32>,
-    #[serde(skip)]
     current_values: Vec<f32>,
     #[serde(skip)]
     prev_time: Option<f32>,
@@ -70,7 +68,6 @@ impl ModulationEngine {
         let entry = ModulationSourceEntry::new(source);
         let uuid = entry.uuid.clone();
         self.sources.push(entry);
-        self.prev_values.push(0.0);
         self.current_values.push(0.0);
         self.uuid_to_idx
             .insert(uuid.clone(), self.sources.len() - 1);
@@ -83,7 +80,6 @@ impl ModulationEngine {
     pub fn add_source_with_uuid(&mut self, uuid: String, source: ModulationSource) -> String {
         let entry = ModulationSourceEntry::with_uuid(uuid.clone(), source);
         self.sources.push(entry);
-        self.prev_values.push(0.0);
         self.current_values.push(0.0);
         self.uuid_to_idx
             .insert(uuid.clone(), self.sources.len() - 1);
@@ -96,9 +92,6 @@ impl ModulationEngine {
     pub fn remove_source(&mut self, uuid: &str) {
         if let Some(idx) = self.uuid_to_idx.get(uuid).copied() {
             self.sources.remove(idx);
-            if idx < self.prev_values.len() {
-                self.prev_values.remove(idx);
-            }
             if idx < self.current_values.len() {
                 self.current_values.remove(idx);
             }
@@ -402,9 +395,6 @@ impl ModulationEngine {
         self.prev_time = Some(time);
 
         let n = self.sources.len();
-        if self.prev_values.len() < n {
-            self.prev_values.resize(n, 0.0);
-        }
         if self.current_values.len() < n {
             self.current_values.resize(n, 0.0);
         }
@@ -413,15 +403,16 @@ impl ModulationEngine {
         self.evaluation_order(); // Ensure cache is valid
         for i_idx in 0..n {
             let i = self.cached_order[i_idx];
+            let prev_value = self.current_values[i];
 
             // Optimization: avoid cloning and applying mod-on-mod if no assignments exist for this source
             let value = if self.resolved_mod_on_mod[i].is_empty() {
                 self.sources[i]
                     .source
-                    .calculate(time, dt, audio, self.prev_values[i])
+                    .calculate(time, dt, audio, prev_value)
             } else {
                 let mut effective = self.apply_mod_on_mod_optimized(i, &self.sources[i].source);
-                let val = effective.calculate(time, dt, audio, self.prev_values[i]);
+                let val = effective.calculate(time, dt, audio, prev_value);
 
                 // Copy back mutable state changes (ADSR stage progression)
                 if let (
@@ -447,7 +438,6 @@ impl ModulationEngine {
             };
 
             self.current_values[i] = value;
-            self.prev_values[i] = value;
         }
     }
 

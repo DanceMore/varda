@@ -17,3 +17,7 @@
 ## 2025-05-14 - [Audio Analysis Arc Optimization]
 **Learning:** Audio analysis data (`waveform` and `fft` arrays) is updated every frame and cloned multiple times (from audio thread to main loop, then into modulation engine). These were `Vec<f32>`, causing $O(N)$ heap allocations and data copies every frame.
 **Action:** Use `Arc<[f32]>` for large audio data arrays. This makes clones $O(1)$ via reference counting. Since the data is read-only once published, `Arc` provides the correct semantics with significantly lower overhead.
+
+## 2025-05-14 - [Modulation Engine Redundant State and Arc Optimization]
+**Learning:** The `ModulationEngine` maintained a redundant `prev_values` vector that was a mirror of `current_values` at the end of every frame. Furthermore, `StepSequencer` sources with 'mod-on-mod' assignments were performing a heap-allocating `clone()` of their steps every frame.
+**Action:** Eliminate `prev_values` and read directly from `current_values` before overwriting in the topologically-ordered update loop. Switch `StepSequencer` to use `Arc<[f32]>` for steps to convert (N)$ clones into (1)$ reference increments.
