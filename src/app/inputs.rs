@@ -13,14 +13,15 @@ impl VardaApp {
     /// redundant reconstructions in snapshots and main rendering.
     pub(crate) fn collect_frame_audio_values(&mut self) {
         self.frame_audio_values.clear();
-        for id in self.audio_manager.active_source_ids() {
-            if let Some(data) = self.audio_manager.get_data(id) {
-                self.frame_audio_values.sources.insert(id, crate::modulation::AudioSourceValues {
+        for (id, data) in self.audio_manager.active_sources() {
+            self.frame_audio_values.sources.insert(
+                id,
+                crate::modulation::AudioSourceValues {
                     fft: data.fft.clone(),
                     level: data.level,
                     sample_rate: data.sample_rate,
-                });
-            }
+                },
+            );
         }
     }
 

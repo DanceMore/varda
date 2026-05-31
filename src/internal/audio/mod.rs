@@ -250,8 +250,21 @@ impl AudioManager {
     }
 
     /// Get IDs of all active (open) sources.
-    pub fn active_source_ids(&self) -> Vec<AudioSourceId> {
-        self.active.keys().copied().collect()
+    /// Optimization: Returns an iterator to avoid per-frame Vec allocation.
+    pub fn active_source_ids(&self) -> impl Iterator<Item = AudioSourceId> + '_ {
+        self.active.keys().copied()
+    }
+
+    /// Get all active sources and their latest data.
+    /// Optimization: Returns an iterator to avoid per-frame Vec allocation and redundant lookups.
+    pub fn active_sources(&self) -> impl Iterator<Item = (AudioSourceId, &AudioData)> + '_ {
+        self.active.iter().map(|(id, s)| (*id, &s.latest))
+    }
+
+    /// Check if a specific audio source is currently active.
+    /// Optimization: O(1) lookup in the active sources map.
+    pub fn is_source_active(&self, id: AudioSourceId) -> bool {
+        self.active.contains_key(&id)
     }
 
     /// Check if any source is active.
