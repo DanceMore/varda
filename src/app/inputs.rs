@@ -8,6 +8,22 @@ use super::VardaApp;
 impl VardaApp {
     /// Process all external inputs: shader hot-reload, audio, OSC, MIDI.
     /// Changed parameter paths are collected and broadcast to OSC feedback targets.
+    /// Collect fresh audio analysis values for the current frame.
+    /// This populates `self.frame_audio_values` once per frame to avoid
+    /// redundant reconstructions in snapshots and main rendering.
+    pub(crate) fn collect_frame_audio_values(&mut self) {
+        self.frame_audio_values.clear();
+        for id in self.audio_manager.active_source_ids() {
+            if let Some(data) = self.audio_manager.get_data(id) {
+                self.frame_audio_values.sources.insert(id, crate::modulation::AudioSourceValues {
+                    fft: data.fft.clone(),
+                    level: data.level,
+                    sample_rate: data.sample_rate,
+                });
+            }
+        }
+    }
+
     pub fn process_inputs(&mut self) {
         // Collect (path, value) pairs changed this frame for OSC feedback
         let mut changed_params: Vec<(String, f32)> = Vec::new();
@@ -36,20 +52,11 @@ impl VardaApp {
         // Update audio textures (using primary source)
         self.audio_textures.update(&self.context.queue, self.audio_manager.get_primary_data());
 
-        // Pre-update modulation with fresh audio so snapshots read current values
-        {
-            let mut av = crate::modulation::AudioValues::default();
-            for id in self.audio_manager.active_source_ids() {
-                if let Some(data) = self.audio_manager.get_data(id) {
-                    av.sources.insert(id, crate::modulation::AudioSourceValues {
-                        fft: data.fft.clone(),
-                        level: data.level,
-                        sample_rate: data.sample_rate,
-                    });
-                }
-            }
-            self.mixer.update_modulation(&av);
-        }
+        // Pre-update modulation with fresh audio so snapshots read current values.
+        // We populate the frame-global cache here so later stages (mixer render, sub-mixes)
+        // can reuse it without reallocating.
+        self.collect_frame_audio_values();
+        self.mixer.update_modulation(&self.frame_audio_values);
 
         // Process OSC messages via shared param router
         if let Some(osc) = &self.input.osc_receiver {

@@ -37,6 +37,11 @@ pub struct AudioValues {
 }
 
 impl AudioValues {
+    /// Clear all audio source data. Reuses the HashMap's capacity.
+    pub fn clear(&mut self) {
+        self.sources.clear();
+    }
+
     /// Get the first/primary source's data (convenience).
     pub fn primary(&self) -> Option<&AudioSourceValues> {
         self.sources.iter().min_by_key(|(id, _)| **id).map(|(_, v)| v)

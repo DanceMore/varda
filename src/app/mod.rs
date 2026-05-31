@@ -185,6 +185,9 @@ pub struct VardaApp {
     // ── Audio textures (GPU resource, owned here) ──────────────
     audio_textures: crate::audio::AudioTextures,
 
+    /// Cached audio values for the current frame to avoid redundant reconstruction.
+    pub(crate) frame_audio_values: crate::modulation::AudioValues,
+
     // ── Render resolution (configurable, scene-level) ───────
     render_width: u32,
     render_height: u32,
@@ -359,6 +362,7 @@ impl VardaApp {
                 state_tx,
             },
             audio_textures,
+            frame_audio_values: crate::modulation::AudioValues::default(),
             render_width: DEFAULT_RENDER_WIDTH,
             render_height: DEFAULT_RENDER_HEIGHT,
             midi_pending_undo: false,

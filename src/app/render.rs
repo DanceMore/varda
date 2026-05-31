@@ -157,23 +157,24 @@ impl VardaApp {
     /// Render the mixer frame: update cameras, NDI, Syphon, collect audio, render mixer.
     /// This performs all GPU work that doesn't need the surface texture.
     pub fn render_mixer_frame(&mut self) {
-        // Compute effective channel opacities to determine which cameras are needed
+        // Collect camera IDs needed by visible channels.
+        // We compute effective opacities on-the-fly to avoid per-frame Vec allocation.
+        let mut needed_camera_ids = std::collections::HashSet::new();
         let channel_count = self.mixer.channel_count();
         let crossfader = self.mixer.crossfader();
-        let effective_opacities: Vec<f32> = if channel_count == 2 {
-            let channels = self.mixer.channels();
-            vec![
-                (1.0 - crossfader) * channels[0].opacity,
-                crossfader * channels[1].opacity,
-            ]
-        } else {
-            self.mixer.channels().iter().map(|ch| ch.opacity).collect()
-        };
 
-        // Collect camera IDs needed by visible channels
-        let mut needed_camera_ids = std::collections::HashSet::new();
         for (ch_idx, channel) in self.mixer.channels().iter().enumerate() {
-            if effective_opacities.get(ch_idx).copied().unwrap_or(0.0) <= 0.0 {
+            let opacity = if channel_count == 2 {
+                match ch_idx {
+                    0 => (1.0 - crossfader) * channel.opacity,
+                    1 => crossfader * channel.opacity,
+                    _ => 0.0,
+                }
+            } else {
+                channel.opacity
+            };
+
+            if opacity <= 0.0 {
                 continue;
             }
             for slot in &channel.decks {
@@ -227,23 +228,8 @@ impl VardaApp {
             }
         }
 
-        // Collect audio values for modulation
-        let audio_values = {
-            let mut av = crate::modulation::AudioValues::default();
-            for id in self.audio_manager.active_source_ids() {
-                if let Some(data) = self.audio_manager.get_data(id) {
-                    av.sources.insert(
-                        id,
-                        crate::modulation::AudioSourceValues {
-                            fft: data.fft.clone(),
-                            level: data.level,
-                            sample_rate: data.sample_rate,
-                        },
-                    );
-                }
-            }
-            av
-        };
+        // Reuse frame-global audio analysis values populated in process_inputs()
+        let audio_values = &self.frame_audio_values;
 
         let mut primary_audio = self.audio_manager.get_primary_data().clone();
 
@@ -256,7 +242,7 @@ impl VardaApp {
 
         if let Err(e) = self
             .mixer
-            .render(&self.context, &primary_audio, &audio_values)
+            .render(&self.context, &primary_audio, audio_values)
         {
             log::error!("Failed to render mixer: {}", e);
         }
