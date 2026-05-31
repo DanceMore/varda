@@ -13,3 +13,7 @@
 ## 2025-05-14 - [Eliminating Per-Frame Allocations in Channel Hot Path]
 **Learning:** `Channel::render` and `Channel::tick_auto_transitions` were allocating multiple `Vec`s every frame for deck sorting and compositing metadata. In a performance-critical rendering loop, these heap allocations add significant pressure and latency.
 **Action:** Move scratchpad vectors (`deck_indices`, `composite_info`, `just_started_transitioning`) into the `Channel` struct using `#[serde(skip)]`. Use a two-pass iteration strategy in `render` to avoid intermediate "ordered" vectors. Ensure metadata structs implement `Copy` to avoid borrow checker conflicts when calling mutable struct methods while iterating.
+
+## 2025-05-14 - [Audio Analysis Arc Optimization]
+**Learning:** Audio analysis data (`waveform` and `fft` arrays) is updated every frame and cloned multiple times (from audio thread to main loop, then into modulation engine). These were `Vec<f32>`, causing $O(N)$ heap allocations and data copies every frame.
+**Action:** Use `Arc<[f32]>` for large audio data arrays. This makes clones $O(1)$ via reference counting. Since the data is read-only once published, `Arc` provides the correct semantics with significantly lower overhead.

@@ -44,9 +44,9 @@ pub struct AudioDeviceInfo {
 #[derive(Clone)]
 pub struct AudioData {
     /// Raw waveform data (normalized -1.0 to 1.0)
-    pub waveform: Vec<f32>,
+    pub waveform: Arc<[f32]>,
     /// FFT magnitude spectrum (0.0 to 1.0, normalized)
-    pub fft: Vec<f32>,
+    pub fft: Arc<[f32]>,
     /// Current RMS level (0.0 to 1.0)
     pub level: f32,
     /// Detected BPM (if available)
@@ -60,8 +60,8 @@ pub struct AudioData {
 impl Default for AudioData {
     fn default() -> Self {
         Self {
-            waveform: vec![0.0; AUDIO_BUFFER_SIZE],
-            fft: vec![0.0; FFT_SIZE / 2],
+            waveform: Arc::from(vec![0.0; AUDIO_BUFFER_SIZE]),
+            fft: Arc::from(vec![0.0; FFT_SIZE / 2]),
             level: 0.0,
             bpm: None,
             time_since_beat: 0.0,
@@ -409,8 +409,8 @@ impl AudioManager {
                         now.duration_since(last_beat_time).as_secs_f32();
 
                     let data = AudioData {
-                        waveform,
-                        fft: fft_magnitudes,
+                        waveform: Arc::from(waveform),
+                        fft: Arc::from(fft_magnitudes),
                         level,
                         bpm: current_bpm,
                         time_since_beat,
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn bin_resolution_at_48khz() {
         let data = AudioData {
-            fft: vec![0.0; FFT_SIZE / 2],
+            fft: Arc::from(vec![0.0; FFT_SIZE / 2]),
             sample_rate: 48000.0,
             ..AudioData::default()
         };
@@ -723,8 +723,8 @@ mod tests {
     #[test]
     fn chaos_energy_in_range_nan_freq_low() {
         let data = AudioData {
-            waveform: vec![0.0; 128],
-            fft: vec![0.5; 1024],
+            waveform: Arc::from(vec![0.0; 128]),
+            fft: Arc::from(vec![0.5; 1024]),
             level: 0.5,
             bpm: None,
             time_since_beat: 0.0,
@@ -739,8 +739,8 @@ mod tests {
     #[test]
     fn chaos_energy_in_range_nan_freq_high() {
         let data = AudioData {
-            waveform: vec![0.0; 128],
-            fft: vec![0.5; 1024],
+            waveform: Arc::from(vec![0.0; 128]),
+            fft: Arc::from(vec![0.5; 1024]),
             level: 0.5,
             bpm: None,
             time_since_beat: 0.0,
@@ -753,8 +753,8 @@ mod tests {
     #[test]
     fn chaos_energy_in_range_both_nan() {
         let data = AudioData {
-            waveform: vec![0.0; 128],
-            fft: vec![0.5; 1024],
+            waveform: Arc::from(vec![0.0; 128]),
+            fft: Arc::from(vec![0.5; 1024]),
             level: 0.5,
             bpm: None,
             time_since_beat: 0.0,
@@ -767,8 +767,8 @@ mod tests {
     #[test]
     fn chaos_energy_in_range_negative_frequencies() {
         let data = AudioData {
-            waveform: vec![0.0; 128],
-            fft: vec![0.5; 1024],
+            waveform: Arc::from(vec![0.0; 128]),
+            fft: Arc::from(vec![0.5; 1024]),
             level: 0.5,
             bpm: None,
             time_since_beat: 0.0,
@@ -782,8 +782,8 @@ mod tests {
     #[test]
     fn chaos_energy_in_range_infinity() {
         let data = AudioData {
-            waveform: vec![0.0; 128],
-            fft: vec![0.5; 1024],
+            waveform: Arc::from(vec![0.0; 128]),
+            fft: Arc::from(vec![0.5; 1024]),
             level: 0.5,
             bpm: None,
             time_since_beat: 0.0,
@@ -796,8 +796,8 @@ mod tests {
     #[test]
     fn chaos_energy_in_range_inverted_range() {
         let data = AudioData {
-            waveform: vec![0.0; 128],
-            fft: vec![0.5; 1024],
+            waveform: Arc::from(vec![0.0; 128]),
+            fft: Arc::from(vec![0.5; 1024]),
             level: 0.5,
             bpm: None,
             time_since_beat: 0.0,
@@ -810,8 +810,8 @@ mod tests {
     #[test]
     fn chaos_energy_in_range_zero_sample_rate() {
         let data = AudioData {
-            waveform: vec![0.0; 128],
-            fft: vec![0.5; 1024],
+            waveform: Arc::from(vec![0.0; 128]),
+            fft: Arc::from(vec![0.5; 1024]),
             level: 0.5,
             bpm: None,
             time_since_beat: 0.0,
@@ -825,8 +825,8 @@ mod tests {
     #[test]
     fn chaos_energy_in_range_empty_fft() {
         let data = AudioData {
-            waveform: vec![],
-            fft: vec![],
+            waveform: Arc::from(vec![]),
+            fft: Arc::from(vec![]),
             level: 0.0,
             bpm: None,
             time_since_beat: 0.0,
@@ -839,8 +839,8 @@ mod tests {
     #[test]
     fn chaos_energy_in_range_single_bin_fft() {
         let data = AudioData {
-            waveform: vec![0.0; 2],
-            fft: vec![1.0],
+            waveform: Arc::from(vec![0.0; 2]),
+            fft: Arc::from(vec![1.0]),
             level: 1.0,
             bpm: None,
             time_since_beat: 0.0,

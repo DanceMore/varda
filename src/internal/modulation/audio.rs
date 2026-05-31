@@ -1,9 +1,11 @@
 //! Audio analysis values for the modulation engine.
 
+use std::sync::Arc;
+
 /// Audio analysis values for a single source, passed to modulation engine.
 #[derive(Debug, Clone)]
 pub struct AudioSourceValues {
-    pub fft: Vec<f32>,
+    pub fft: Arc<[f32]>,
     pub level: f32,
     pub sample_rate: f32,
 }
