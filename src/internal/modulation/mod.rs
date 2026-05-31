@@ -379,25 +379,25 @@ mod tests {
 
     #[test]
     fn audio_energy_empty_fft() {
-        let source = AudioSourceValues { fft: vec![], level: 0.0, sample_rate: 48000.0 };
+        let source = AudioSourceValues { fft: Arc::from(vec![]), level: 0.0, sample_rate: 48000.0 };
         assert_eq!(source.energy_in_range(20.0, 250.0), 0.0);
     }
 
     #[test]
     fn audio_energy_zero_sample_rate() {
-        let source = AudioSourceValues { fft: vec![0.5; 256], level: 0.5, sample_rate: 0.0 };
+        let source = AudioSourceValues { fft: Arc::from(vec![0.5; 256]), level: 0.5, sample_rate: 0.0 };
         assert_eq!(source.energy_in_range(20.0, 250.0), 0.0);
     }
 
     #[test]
     fn audio_energy_silent() {
-        let source = AudioSourceValues { fft: vec![0.0; 256], level: 0.0, sample_rate: 48000.0 };
+        let source = AudioSourceValues { fft: Arc::from(vec![0.0; 256]), level: 0.0, sample_rate: 48000.0 };
         assert_eq!(source.energy_in_range(20.0, 250.0), 0.0);
     }
 
     #[test]
     fn audio_energy_loud_signal() {
-        let source = AudioSourceValues { fft: vec![1.0; 256], level: 1.0, sample_rate: 48000.0 };
+        let source = AudioSourceValues { fft: Arc::from(vec![1.0; 256]), level: 1.0, sample_rate: 48000.0 };
         let energy = source.energy_in_range(20.0, 20000.0);
         assert!((energy - 1.0).abs() < 0.01, "Full signal energy: {energy}");
     }
@@ -405,8 +405,8 @@ mod tests {
     #[test]
     fn audio_values_primary_returns_lowest_id() {
         let mut av = AudioValues::default();
-        av.sources.insert(5, AudioSourceValues { fft: vec![], level: 0.5, sample_rate: 48000.0 });
-        av.sources.insert(2, AudioSourceValues { fft: vec![], level: 0.8, sample_rate: 48000.0 });
+        av.sources.insert(5, AudioSourceValues { fft: Arc::from(vec![]), level: 0.5, sample_rate: 48000.0 });
+        av.sources.insert(2, AudioSourceValues { fft: Arc::from(vec![]), level: 0.8, sample_rate: 48000.0 });
         let primary = av.primary().unwrap();
         assert!((primary.level - 0.8).abs() < 1e-5);
     }
@@ -611,7 +611,7 @@ mod tests {
         };
         let mut audio = AudioValues::default();
         audio.sources.insert(0, AudioSourceValues {
-            fft: vec![0.001; 256],
+            fft: Arc::from(vec![0.001; 256]),
             level: 0.001,
             sample_rate: 48000.0,
         });
