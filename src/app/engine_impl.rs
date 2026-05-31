@@ -398,7 +398,6 @@ impl AudioCommands for VardaApp {
 impl AudioQueries for VardaApp {
     fn audio_snapshot(&self) -> AudioSnapshot {
         let primary_audio = self.audio_manager.get_primary_data();
-        let active_ids = self.audio_manager.active_source_ids();
         AudioSnapshot {
             level: primary_audio.level,
             bass: primary_audio.bass(),
@@ -407,11 +406,16 @@ impl AudioQueries for VardaApp {
             bpm: primary_audio.bpm,
             beat_phase: primary_audio.beat_phase(),
             enabled: self.audio_manager.has_active_source(),
-            devices: self.audio_manager.devices().iter().map(|d| AudioDeviceSnapshot {
-                id: d.id,
-                name: d.name.clone(),
-                active: active_ids.contains(&d.id),
-            }).collect(),
+            devices: self
+                .audio_manager
+                .devices()
+                .iter()
+                .map(|d| AudioDeviceSnapshot {
+                    id: d.id,
+                    name: d.name.clone(),
+                    active: self.audio_manager.is_source_active(d.id),
+                })
+                .collect(),
             fft: primary_audio.fft.clone(),
             sample_rate: primary_audio.sample_rate,
         }
