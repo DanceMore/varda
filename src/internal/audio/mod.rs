@@ -336,9 +336,15 @@ impl AudioManager {
         let mut beat_intervals: Vec<f32> = Vec::with_capacity(BPM_HISTORY_SIZE);
         let mut current_bpm: Option<f32> = None;
 
+        // Optimization: pre-allocate buffers reused in the audio callback hot loop.
+        let mut fft_input: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); FFT_SIZE];
+        let mut sort_scratch: Vec<f32> = Vec::with_capacity(BPM_HISTORY_SIZE.max(ONSET_MEDIAN_WINDOW + 1));
+
         let stream = device.build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
+                // Optimization: reserve capacity once to avoid multiple reallocations during pushing.
+                sample_buffer.reserve(data.len() / channels);
                 for chunk in data.chunks(channels) {
                     let sample: f32 = chunk.iter()
                         .map(|s| <f32 as Sample>::from_sample(*s))
@@ -361,13 +367,13 @@ impl AudioManager {
                     ring_write_pos = (ring_write_pos + FFT_HOP) % FFT_SIZE;
 
                     // Extract linearized 2048-sample frame, apply Hann window
-                    let mut fft_input: Vec<Complex<f32>> = Vec::with_capacity(FFT_SIZE);
+                    // Optimization: reuse pre-allocated fft_input to avoid per-hop heap allocation.
                     for i in 0..FFT_SIZE {
                         let idx = (ring_write_pos + i) % FFT_SIZE;
-                        fft_input.push(Complex::new(
+                        fft_input[i] = Complex::new(
                             ring_buffer[idx] * hann_window[i],
                             0.0,
-                        ));
+                        );
                     }
                     fft.process(&mut fft_input);
 
@@ -394,12 +400,14 @@ impl AudioManager {
                         flux_history.remove(0);
                     }
                     let onset_threshold = {
-                        let mut sorted = flux_history.clone();
-                        sorted.sort_by(|a, b| a.total_cmp(b));
-                        if sorted.is_empty() {
+                        // Optimization: reuse pre-allocated sort_scratch for median calculation.
+                        sort_scratch.clear();
+                        sort_scratch.extend_from_slice(&flux_history);
+                        sort_scratch.sort_by(|a, b| a.total_cmp(b));
+                        if sort_scratch.is_empty() {
                             ONSET_THRESHOLD_OFFSET
                         } else {
-                            sorted[sorted.len() / 2] * ONSET_THRESHOLD_MULTIPLIER
+                            sort_scratch[sort_scratch.len() / 2] * ONSET_THRESHOLD_MULTIPLIER
                                 + ONSET_THRESHOLD_OFFSET
                         }
                     };
@@ -418,21 +426,23 @@ impl AudioManager {
                                 beat_intervals.remove(0);
                             }
                             if beat_intervals.len() >= 4 {
-                                let mut sorted = beat_intervals.clone();
-                                sorted
-                                    .sort_by(|a, b| a.total_cmp(b));
-                                let median = sorted[sorted.len() / 2];
-                                let stable: Vec<f32> = beat_intervals
+                                // Optimization: reuse pre-allocated sort_scratch for BPM median calculation.
+                                sort_scratch.clear();
+                                sort_scratch.extend_from_slice(&beat_intervals);
+                                sort_scratch.sort_by(|a, b| a.total_cmp(b));
+                                let median = sort_scratch[sort_scratch.len() / 2];
+
+                                // Optimization: calculate average of stable intervals without intermediate Vec allocation.
+                                let (sum, count) = beat_intervals
                                     .iter()
                                     .filter(|&&iv| {
                                         (iv - median).abs() / median
                                             < TEMPO_TOLERANCE
                                     })
-                                    .copied()
-                                    .collect();
-                                if stable.len() >= 2 {
-                                    let avg = stable.iter().sum::<f32>()
-                                        / stable.len() as f32;
+                                    .fold((0.0f32, 0usize), |(s, c), &iv| (s + iv, c + 1));
+
+                                if count >= 2 {
+                                    let avg = sum / count as f32;
                                     let bpm = 60.0 / avg;
                                     if (30.0..=300.0).contains(&bpm) {
                                         current_bpm = Some(bpm);
