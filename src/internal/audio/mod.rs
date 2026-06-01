@@ -328,7 +328,7 @@ impl AudioManager {
         let mut ring_write_pos: usize = 0;
 
         // Spectral flux onset detection state
-        let mut prev_fft_magnitudes: Vec<f32> = vec![0.0; FFT_SIZE / 2];
+        let mut prev_fft_magnitudes: Arc<[f32]> = Arc::from(vec![0.0; FFT_SIZE / 2]);
         let mut flux_history: Vec<f32> = Vec::with_capacity(ONSET_MEDIAN_WINDOW + 1);
 
         // BPM detection state
@@ -416,7 +416,10 @@ impl AudioManager {
                     let elapsed = now.duration_since(last_beat_time).as_secs_f32();
                     let is_onset =
                         spectral_flux > onset_threshold && elapsed > MIN_BEAT_INTERVAL;
-                    prev_fft_magnitudes.clone_from(&fft_magnitudes);
+
+                    // Optimization: Use Arc for O(1) FFT magnitude sharing between frames and data snapshots.
+                    let fft_magnitudes_arc: Arc<[f32]> = Arc::from(fft_magnitudes);
+                    prev_fft_magnitudes = fft_magnitudes_arc.clone();
 
                     // BPM estimation with outlier rejection
                     if is_onset {
@@ -466,7 +469,7 @@ impl AudioManager {
 
                     let data = AudioData {
                         waveform: Arc::from(waveform),
-                        fft: Arc::from(fft_magnitudes),
+                        fft: fft_magnitudes_arc,
                         level,
                         bpm: current_bpm,
                         time_since_beat,
